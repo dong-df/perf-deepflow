@@ -149,6 +149,8 @@ func Start(configPath string, shared *servercommon.ControllerIngesterShared) []i
 			// If there is a table name change, do the table name update first
 			err = issu.RunRenameTable(ds)
 			checkError(err)
+			err = issu.RunRecreateTables()
+			checkError(err)
 		}
 
 		// platformData manager init
