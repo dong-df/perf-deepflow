@@ -48,7 +48,7 @@ use crate::error;
 use crate::{
     common::ebpf::{GO_HTTP2_UPROBE, GO_HTTP2_UPROBE_DATA},
     ebpf::{
-        MSG_REASM_SEG, MSG_REASM_START, MSG_REQUEST_END, MSG_RESPONSE_END,
+        MSG_CLOSE, MSG_REASM_SEG, MSG_REASM_START, MSG_REQUEST_END, MSG_RESPONSE_END,
         PACKET_KNAME_MAX_PADDING, SK_BPF_DATA, SOCK_DATA_HTTP2, SOCK_DATA_TLS_HTTP2, SOCK_DIR_RCV,
         SOCK_DIR_SND,
     },
@@ -145,6 +145,7 @@ bitflags! {
         const NONE = FlagBits::FlagNone as u32;
         const TLS = FlagBits::FlagTls as u32;
         const ASYNC = FlagBits::FlagAsync as u32;
+        const REVERSED = FlagBits::FlagReversed as u32;
     }
 }
 
@@ -238,6 +239,7 @@ pub struct MetaPacket<'a> {
     pub raw_from_ebpf_offset: usize,
     pub sub_packet_index: usize,
     pub sub_packets: Vec<SubPacket>,
+    pub is_socket_closed: bool,
 
     pub socket_id: u64,
     pub cap_start_seq: u64,
@@ -266,6 +268,8 @@ pub struct MetaPacket<'a> {
     /********** for GPID **********/
     pub gpid_0: u32,
     pub gpid_1: u32,
+
+    pub ip_id: u16,
 }
 
 impl<'a> MetaPacket<'a> {
@@ -340,6 +344,14 @@ impl<'a> MetaPacket<'a> {
     pub fn is_psh_ack(&self) -> bool {
         if let ProtocolData::TcpHeader(tcp_data) = &self.protocol_data {
             return tcp_data.flags & TcpFlags::MASK == TcpFlags::PSH_ACK && self.payload_len > 1;
+        }
+        false
+    }
+
+    #[inline]
+    pub fn is_fin(&self) -> bool {
+        if let ProtocolData::TcpHeader(tcp_data) = &self.protocol_data {
+            return tcp_data.flags & TcpFlags::FIN == TcpFlags::FIN;
         }
         false
     }
@@ -780,6 +792,7 @@ impl<'a> MetaPacket<'a> {
                 ip_protocol = IpProtocol::from(packet[IPV4_PROTO_OFFSET + vlan_tag_size]);
                 self.lookup_key.proto = ip_protocol;
 
+                self.ip_id = read_u16_be(&packet[FIELD_OFFSET_ID + vlan_tag_size..]);
                 let frag = read_u16_be(&packet[FIELD_OFFSET_FRAG + vlan_tag_size..]);
                 if frag & 0xFFF != 0 {
                     // fragment
@@ -1162,13 +1175,14 @@ impl<'a> MetaPacket<'a> {
             ApplicationFlags::NONE
         };
         packet.segment_flags = SegmentFlags::from(data.msg_type);
+        packet.is_socket_closed = data.msg_type == MSG_CLOSE;
 
         // 目前只有 go uprobe http2 的方向判断能确保准确
         if data.source == GO_HTTP2_UPROBE || data.source == GO_HTTP2_UPROBE_DATA {
             if data.l7_protocol_hint == SOCK_DATA_HTTP2
                 || data.l7_protocol_hint == SOCK_DATA_TLS_HTTP2
             {
-                packet.lookup_key.direction = PacketDirection::from(data.msg_type);
+                packet.lookup_key.direction = Self::parse_direction(data.msg_type);
                 match data.msg_type {
                     MSG_REQUEST_END => packet.is_request_end = true,
                     MSG_RESPONSE_END => packet.is_response_end = true,
@@ -1177,6 +1191,20 @@ impl<'a> MetaPacket<'a> {
             }
         }
         return Ok(packet);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[inline]
+    fn parse_direction(msg_type: u8) -> PacketDirection {
+        match msg_type {
+            crate::ebpf::MSG_REQUEST | crate::ebpf::MSG_REQUEST_END => {
+                PacketDirection::ClientToServer
+            }
+            crate::ebpf::MSG_RESPONSE | crate::ebpf::MSG_RESPONSE_END => {
+                PacketDirection::ServerToClient
+            }
+            _ => panic!("ebpf direction({}) unknown.", msg_type),
+        }
     }
 
     #[inline]

@@ -21,7 +21,11 @@ pub mod shared_obj;
 pub mod wasm;
 
 use prost::Message;
-use public::{bytes::read_u32_be, counter::Countable, l7_protocol::L7Protocol};
+use public::{
+    bytes::read_u32_be,
+    counter::Countable,
+    l7_protocol::{L7Protocol, LogMessageType},
+};
 use serde::Serialize;
 
 use crate::{
@@ -37,7 +41,7 @@ use crate::{
                 ExtendedInfo, KeyVal, L7ProtocolSendLog, L7Request, L7Response, MetricKeyVal,
                 TraceInfo,
             },
-            swap_if, L7ResponseStatus, LogMessageType,
+            swap_if, L7ResponseStatus,
         },
         AppProtoHead, Error,
     },
@@ -60,6 +64,8 @@ pub struct CustomInfoResp {
     pub code: Option<i32>,
     pub exception: String,
     pub result: String,
+    pub req_type: String,
+    pub endpoint: String,
 }
 
 #[derive(Debug, Default, Serialize, Clone)]
@@ -108,11 +114,14 @@ pub struct CustomInfo {
     pub metrics: Vec<MetricKeyVal>,
 
     pub biz_type: u8,
+    pub biz_code: Option<String>,
+    pub biz_scenario: Option<String>,
 
     #[serde(skip)]
     pub is_on_blacklist: bool,
 
     pub is_async: Option<bool>,
+    pub is_reversed: Option<bool>,
 }
 
 impl CustomInfo {
@@ -187,7 +196,8 @@ impl CustomInfo {
             ) x len(kv)
 
         biz type: 1 byte
-        is async: 1 byte
+        // is async: 1 byte
+        // is reversed: 1 byte
     */
     fn from_legacy_protocol(buf: &[u8], dir: PacketDirection) -> Result<Self, Error> {
         let mut off = 0;
@@ -444,7 +454,10 @@ impl CustomInfo {
                 })
                 .collect(),
             biz_type: pb_info.biz_type.unwrap_or_default() as u8,
+            biz_code: pb_info.biz_code,
+            biz_scenario: pb_info.biz_scenario,
             is_async: pb_info.is_async,
+            is_reversed: pb_info.is_reversed,
             ..Default::default()
         };
         match pb_info.info {
@@ -474,6 +487,8 @@ impl CustomInfo {
                     code: r.code,
                     result: r.result.unwrap_or_default(),
                     exception: r.exception.unwrap_or_default(),
+                    req_type: r.r#type.unwrap_or_default(),
+                    endpoint: r.endpoint.unwrap_or_default(),
                 };
             }
             _ => (),
@@ -594,6 +609,9 @@ impl L7ProtocolInfoInterface for CustomInfo {
             swap_if!(self.trace, http_proxy_client, is_none, w.trace);
 
             self.attributes.append(&mut w.attributes);
+
+            swap_if!(self, biz_code, is_none, w);
+            swap_if!(self, biz_scenario, is_none, w);
         }
         Ok(())
     }
@@ -624,6 +642,10 @@ impl L7ProtocolInfoInterface for CustomInfo {
 
     fn get_biz_type(&self) -> u8 {
         self.biz_type
+    }
+
+    fn is_reversed(&self) -> bool {
+        self.is_reversed.unwrap_or_default()
     }
 }
 

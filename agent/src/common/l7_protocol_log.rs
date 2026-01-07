@@ -47,33 +47,15 @@ use crate::flow_generator::protocol_logs::{
     RedisLog, RocketmqLog, SofaRpcLog, TarsLog, ZmtpLog,
 };
 
-use crate::flow_generator::{LogMessageType, Result};
+use crate::flow_generator::Result;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::plugin::c_ffi::SoPluginFunc;
 use crate::plugin::wasm::WasmVm;
 
 use public::enums::IpProtocol;
-use public::l7_protocol::{CustomProtocol, L7Protocol, L7ProtocolChecker, L7ProtocolEnum};
-
-/*
- 所有协议都需要实现L7ProtocolLogInterface这个接口.
- 其中，check_payload 用于MetaPacket判断应用层协议，parse_payload 用于解析具体协议.
- 更具体就是遍历ALL_PROTOCOL的协议，用check判断协议，再用parse解析整个payload，得到L7ProtocolInfo.
- 最后发送到server之前，调用into() 转成通用结构L7ProtocolSendLog.
-
- all protocol need implement L7ProtocolLogInterface trait.
- check_payload use to determine what protocol the payload is.
- parse_payload use to parse whole payload.
- more specifically, traversal all protocol from get_all_protocol,check the payload and then parse it,
- get the L7ProtocolInfo enum, finally convert to L7ProtocolSendLog struct and send to server.
-
- the parser flow:
-
-    check_payload -> parse_payload -> reset --
-                        /|\                  |
-                         |                   |
-                         |_____next packet___|
-*/
+use public::l7_protocol::{
+    CustomProtocol, L7Protocol, L7ProtocolChecker, L7ProtocolEnum, LogMessageType,
+};
 
 macro_rules! count {
     () => (0);
@@ -96,6 +78,7 @@ macro_rules! impl_protocol_parser {
                         match p.protocol() {
                             L7Protocol::Http1 => return "HTTP",
                             L7Protocol::Http2 => return "HTTP2",
+                            L7Protocol::Triple => return "Triple",
                             _ => unreachable!()
                         }
                     },
@@ -115,6 +98,7 @@ macro_rules! impl_protocol_parser {
                     "HTTP" => Ok(Self::Http(HttpLog::new_v1())),
                     "HTTP2" => Ok(Self::Http(HttpLog::new_v2(false))),
                     "gRPC" => Ok(Self::Http(HttpLog::new_v2(true))),
+                    "Triple" => Ok(Self::Http(HttpLog::new_triple())),
                     "Custom"=>Ok(Self::Custom(Default::default())),
                     #[cfg(feature = "enterprise")]
                     "ISO-8583"=>Ok(Self::Iso8583(Default::default())),
@@ -134,6 +118,7 @@ macro_rules! impl_protocol_parser {
                     L7Protocol::Http1 => Some(L7ProtocolParser::Http(HttpLog::new_v1())),
                     L7Protocol::Http2 => Some(L7ProtocolParser::Http(HttpLog::new_v2(false))),
                     L7Protocol::Grpc => Some(L7ProtocolParser::Http(HttpLog::new_v2(true))),
+                    L7Protocol::Triple => Some(L7ProtocolParser::Http(HttpLog::new_triple())),
 
                     // in check_payload, need to get the default Custom by L7Protocol.
                     // due to Custom not in macro, need to define explicit
@@ -267,7 +252,11 @@ impl L7ParseResult {
 
 #[enum_dispatch]
 pub trait L7ProtocolParserInterface {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool;
+    // Determine whether the current payload belongs to this protocol, with the return values meaning as follows:
+    // - None: Does not belong to this protocol
+    // - LogMessageType::Request: It is a request that belongs to this protocol
+    // - LogMessageType::Response: It is a response that belongs to this protocol
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType>;
     // 协议解析
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult>;
     // 返回协议号和协议名称，由于的bitmap使用u128，所以协议号不能超过128.
@@ -402,13 +391,23 @@ impl From<&LogCache> for L7PerfStats {
 pub struct LogCacheKey(pub u128);
 
 impl LogCacheKey {
-    pub fn new(param: &ParseParam, session_id: Option<u32>) -> Self {
+    pub fn is_reversed(&self) -> bool {
+        self.0 & (1 << 63) == 1
+    }
+
+    pub fn new(param: &ParseParam, session_id: Option<u32>, is_reversed: bool) -> Self {
         /*
-            if session id is some: flow id 64bit | 0 32bit | session id 32bit
-            if session id is none: flow id 64bit | packet_seq 64bit
+            if session id is some: flow id 64bit | is_reversed 1 bit | 0 31bit | session id 32bit
+            if session id is none: flow id 64bit | is_reversed 1 bit | packet_seq 63bit
         */
         let key = match session_id {
-            Some(sid) => ((param.flow_id as u128) << 64) | sid as u128,
+            Some(sid) => {
+                if is_reversed {
+                    ((param.flow_id as u128) << 64) | 1 << 63 | sid as u128
+                } else {
+                    ((param.flow_id as u128) << 64) | sid as u128
+                }
+            }
             None => {
                 ((param.flow_id as u128) << 64)
                     | (if param.ebpf_type != EbpfType::None {
@@ -419,10 +418,16 @@ impl LogCacheKey {
                         // before parsing the protocol. Therefore, in order to ensure that session aggregation can still
                         // be performed correctly, we need to retain the cap_seq of the last request and the cap_seq of
                         // the first response, so that the cap_seq of the request and response can still be consecutive.
-                        if param.direction == PacketDirection::ClientToServer {
+                        let seq = if param.direction == PacketDirection::ClientToServer {
                             param.packet_end_seq + 1
                         } else {
                             param.packet_start_seq
+                        };
+
+                        if is_reversed {
+                            1 << 63 | seq & 0x7fffffff_ffffffff
+                        } else {
+                            seq & 0x7fffffff_ffffffff
                         }
                     } else {
                         0
@@ -461,7 +466,7 @@ impl RrtCache {
     const LOG_INTERVAL: u64 = 60_000_000;
 
     // When the number of concurrent transactions exceeds this value, the RRT calculation error will occur.
-    const MAX_RRT_CACHE_PER_FLOW: usize = 128;
+    const MAX_RRT_CACHE_PER_FLOW: usize = 16;
 
     pub fn get(&mut self, key: &LogCacheKey) -> Option<&LogCache> {
         self.logs.get(key)
@@ -519,23 +524,27 @@ impl RrtCache {
         ret
     }
 
-    pub fn collect_flow_perf_stats(&mut self, flow_id: u64) -> Option<L7PerfStats> {
+    pub fn collect_flow_perf_stats(&mut self, flow_id: u64) -> Option<(L7PerfStats, L7PerfStats)> {
         let Some(keys) = self.flows.pop(&flow_id) else {
             return None;
         };
-        let value = keys.into_iter().map(|(key, _)| self.logs.pop(&key)).fold(
-            L7PerfStats::default(),
-            |mut stats: L7PerfStats, entry| {
-                if let Some(entry) = entry {
-                    stats.sequential_merge(&L7PerfStats::from(&entry));
+
+        let mut forward = L7PerfStats::default();
+        let mut backward = L7PerfStats::default();
+        for (key, _) in keys {
+            if let Some(cache) = self.logs.pop(&key) {
+                if key.is_reversed() {
+                    backward.sequential_merge(&L7PerfStats::from(&cache));
+                } else {
+                    forward.sequential_merge(&L7PerfStats::from(&cache));
                 }
-                stats
-            },
-        );
-        if value == L7PerfStats::default() {
+            }
+        }
+
+        if forward == L7PerfStats::default() && backward == L7PerfStats::default() {
             None
         } else {
-            Some(value)
+            Some((forward, backward))
         }
     }
 
@@ -552,8 +561,8 @@ impl RrtCache {
 
 #[derive(Default)]
 pub struct TimeoutCacheEntry {
-    pub in_cache: u64,
-    pub timeout: u64,
+    pub in_cache: [u64; 2],
+    pub timeout: [u64; 2],
 }
 
 pub struct TimeoutCache {
@@ -562,17 +571,20 @@ pub struct TimeoutCache {
 }
 
 impl TimeoutCache {
-    pub fn pop_timeout_count(&mut self, flow_id: u64, flow_end: bool) -> u64 {
+    pub fn pop_timeout_count(&mut self, flow_id: u64, flow_end: bool, is_reversed: bool) -> u64 {
         let entry = self.get_or_insert_mut(flow_id);
+        let index = if is_reversed { 1 } else { 0 };
         if flow_end {
-            let v = entry.in_cache + entry.timeout;
+            let v = entry.in_cache[index] + entry.timeout[index];
             self.flows.pop(&flow_id);
             self.cache_len
                 .store(self.flows.len() as u64, Ordering::Relaxed);
+
             v
         } else {
-            let v = entry.timeout;
-            entry.timeout = 0;
+            let v = entry.timeout[index];
+            entry.timeout[index] = 0;
+
             v
         }
     }

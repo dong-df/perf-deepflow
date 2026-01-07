@@ -148,6 +148,9 @@ message Anomaly {
     uint32 l7_client_error = 13;
     uint32 l7_server_error = 14;
     uint32 l7_timeout = 15;
+
+    uint64 client_ooo = 20;
+    uint64 server_ooo = 21;
 }
 
 message FlowLoad {

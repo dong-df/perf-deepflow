@@ -1,3 +1,5 @@
+use public::l7_protocol::LogMessageType;
+
 use crate::{
     common::{
         flow::{L7PerfStats, L7Protocol, PacketDirection},
@@ -10,7 +12,7 @@ use crate::{
         error::{Error, Result},
         protocol_logs::{
             pb_adapter::{ExtendedInfo, KeyVal, L7ProtocolSendLog, L7Request, L7Response},
-            set_captured_byte, AppProtoHead, L7ResponseStatus, LogMessageType,
+            set_captured_byte, AppProtoHead, L7ResponseStatus,
         },
     },
     plugin::wasm::{
@@ -105,6 +107,8 @@ pub struct ZmtpInfo {
     res_msg_size: Option<u64>,
     is_tls: bool,
     is_async: bool,
+    #[serde(skip)]
+    is_reversed: bool,
     rtt: u64,
     status: L7ResponseStatus,
     err_msg: Option<String>,
@@ -139,6 +143,7 @@ impl Default for ZmtpInfo {
             res_msg_size: None,
             is_tls: false,
             is_async: false,
+            is_reversed: false,
             rtt: 0,
             status: L7ResponseStatus::Ok,
             err_msg: None,
@@ -180,6 +185,9 @@ impl ZmtpInfo {
         if res.is_on_blacklist {
             self.is_on_blacklist = res.is_on_blacklist;
         }
+        if res.is_reversed {
+            self.is_reversed = res.is_reversed;
+        }
     }
     fn wasm_hook(&mut self, param: &ParseParam, payload: &[u8]) {
         let mut vm_ref = param.wasm_vm.borrow_mut();
@@ -205,6 +213,9 @@ impl ZmtpInfo {
             }
             if let Some(is_async) = custom.is_async {
                 self.is_async = is_async;
+            }
+            if let Some(is_reversed) = custom.is_reversed {
+                self.is_reversed = is_reversed;
             }
         }
     }
@@ -232,6 +243,9 @@ impl From<ZmtpInfo> for L7ProtocolSendLog {
         };
         if f.is_async {
             flags = flags | ApplicationFlags::ASYNC;
+        }
+        if f.is_reversed {
+            flags = flags | ApplicationFlags::REVERSED;
         }
         L7ProtocolSendLog {
             req_len: f.req_msg_size.map(|x| x as u32),
@@ -304,6 +318,10 @@ impl L7ProtocolInfoInterface for ZmtpInfo {
     }
     fn is_on_blacklist(&self) -> bool {
         self.is_on_blacklist
+    }
+
+    fn is_reversed(&self) -> bool {
+        self.is_reversed
     }
 }
 
@@ -664,8 +682,12 @@ impl ZmtpLog {
 }
 
 impl L7ProtocolParserInterface for ZmtpLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
-        Self::check_protocol(payload, param)
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
+        if Self::check_protocol(payload, param) {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
         if self.perf_stats.is_none() && param.parse_perf {

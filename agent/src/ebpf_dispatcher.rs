@@ -777,8 +777,11 @@ impl EbpfCollector {
     ) -> Result<ConfigHandle> {
         // ebpf core modules init
         let mut handle = ConfigHandle::default();
-        ebpf::set_uprobe_golang_enabled(config.ebpf.socket.uprobe.golang.enabled);
-        if config.ebpf.socket.uprobe.golang.enabled {
+        let is_uprobe_meltdown = crate::utils::guard::is_kernel_ebpf_uprobe_meltdown();
+        ebpf::set_uprobe_golang_enabled(
+            !is_uprobe_meltdown && config.ebpf.socket.uprobe.golang.enabled,
+        );
+        if !is_uprobe_meltdown && config.ebpf.socket.uprobe.golang.enabled {
             let feature = "ebpf.socket.uprobe.golang";
             process_listener.register(feature, set_feature_uprobe_golang);
 
@@ -805,8 +808,10 @@ impl EbpfCollector {
             info!("ebpf golang uprobe proc regexp is empty, skip set")
         }
 
-        ebpf::set_uprobe_openssl_enabled(config.ebpf.socket.uprobe.tls.enabled);
-        if config.ebpf.socket.uprobe.tls.enabled {
+        ebpf::set_uprobe_openssl_enabled(
+            !is_uprobe_meltdown && config.ebpf.socket.uprobe.tls.enabled,
+        );
+        if !is_uprobe_meltdown && config.ebpf.socket.uprobe.tls.enabled {
             let feature = "ebpf.socket.uprobe.tls";
             process_listener.register(feature, set_feature_uprobe_tls);
 
@@ -942,6 +947,15 @@ impl EbpfCollector {
             return Err(Error::EbpfInitError);
         }
 
+        if ebpf::set_virtual_file_collect(config.ebpf.file.io_event.enable_virtual_file_collect)
+            != 0
+        {
+            info!(
+                "ebpf set_virtual_file_collect error: {}",
+                config.ebpf.file.io_event.enable_virtual_file_collect
+            );
+        }
+
         if ebpf::set_io_event_minimal_duration(
             config.ebpf.file.io_event.minimal_duration.as_nanos() as c_ulonglong,
         ) != 0
@@ -1040,16 +1054,18 @@ impl EbpfCollector {
         let off_cpu = &ebpf_conf.profile.off_cpu;
         let memory = &ebpf_conf.profile.memory;
 
-        let profiler_enabled = !on_cpu.disabled
+        let profiler_enabled = (!is_uprobe_meltdown && !on_cpu.disabled)
             || (cfg!(feature = "extended_observability")
-                && (!off_cpu.disabled || !memory.disabled));
+                && (!off_cpu.disabled || (!is_uprobe_meltdown && !memory.disabled)));
         if profiler_enabled {
-            if !on_cpu.disabled {
+            if !is_uprobe_meltdown && !on_cpu.disabled {
                 ebpf::enable_oncpu_profiler();
             } else {
                 ebpf::disable_oncpu_profiler();
             }
-            ebpf::set_dwarf_enabled(!config.ebpf.profile.unwinding.dwarf_disabled);
+            ebpf::set_dwarf_enabled(
+                !is_uprobe_meltdown && !config.ebpf.profile.unwinding.dwarf_disabled,
+            );
             ebpf::set_dwarf_regex(
                 CString::new(config.ebpf.profile.unwinding.dwarf_regex.as_bytes())
                     .unwrap()
@@ -1063,6 +1079,30 @@ impl EbpfCollector {
                 config.ebpf.profile.unwinding.dwarf_shard_map_size as i32,
             );
 
+            // Language-specific profiling configuration
+            // Set feature regex for each language profiler based on configuration
+            // When xxx_disabled is false, set regex to ".*" to enable the feature
+            // When xxx_disabled is true, don't set regex (feature remains disabled)
+            let languages = &config.ebpf.profile.languages;
+            if !languages.python_disabled {
+                ebpf::set_feature_regex(
+                    ebpf::FEATURE_PROFILE_PYTHON,
+                    CString::new(".*").unwrap().as_c_str().as_ptr(),
+                );
+            }
+            if !languages.php_disabled {
+                ebpf::set_feature_regex(
+                    ebpf::FEATURE_PROFILE_PHP,
+                    CString::new(".*").unwrap().as_c_str().as_ptr(),
+                );
+            }
+            if !languages.nodejs_disabled {
+                ebpf::set_feature_regex(
+                    ebpf::FEATURE_PROFILE_V8,
+                    CString::new(".*").unwrap().as_c_str().as_ptr(),
+                );
+            }
+
             #[cfg(feature = "extended_observability")]
             {
                 if !off_cpu.disabled {
@@ -1071,7 +1111,7 @@ impl EbpfCollector {
                     ebpf::disable_offcpu_profiler();
                 }
 
-                if !memory.disabled {
+                if !is_uprobe_meltdown && !memory.disabled {
                     ebpf::enable_memory_profiler();
                 } else {
                     ebpf::disable_memory_profiler();
@@ -1094,10 +1134,9 @@ impl EbpfCollector {
             ) != 0
             {
                 warn!("ebpf start_continuous_profiler error.");
-                return Err(Error::EbpfInitError);
             }
 
-            if !on_cpu.disabled {
+            if !is_uprobe_meltdown && !on_cpu.disabled {
                 let feature = "ebpf.profile.on_cpu";
                 process_listener.register(feature, set_feature_on_cpu);
 
@@ -1153,7 +1192,7 @@ impl EbpfCollector {
                     ebpf::set_offcpu_minblock_time(off_cpu.min_blocking_time.as_micros() as u32);
                 }
 
-                if !memory.disabled {
+                if !is_uprobe_meltdown && !memory.disabled {
                     let feature = "ebpf.profile.memory";
                     process_listener.register(feature, set_feature_memory);
 
@@ -1183,7 +1222,8 @@ impl EbpfCollector {
         #[cfg(feature = "extended_observability")]
         if config.dpdk_enabled {
             let dpdk = &config.ebpf.socket.uprobe.dpdk;
-            if !dpdk.command.is_empty() {
+
+            if !is_uprobe_meltdown && !dpdk.command.is_empty() {
                 ebpf::set_dpdk_cmd_name(
                     CString::new(dpdk.command.as_bytes())
                         .unwrap()
@@ -1191,6 +1231,7 @@ impl EbpfCollector {
                         .as_ptr(),
                 );
             }
+
             if !dpdk.rx_hooks.is_empty() {
                 ebpf::set_dpdk_hooks(
                     ebpf::DPDK_HOOK_TYPE_RECV as c_int,
@@ -1215,7 +1256,7 @@ impl EbpfCollector {
 
         // Istio envoy mtls
         #[cfg(feature = "extended_observability")]
-        if config.ebpf.socket.uprobe.tls.enabled {
+        if !is_uprobe_meltdown && config.ebpf.socket.uprobe.tls.enabled {
             ebpf::envoy_trace_start();
         }
 
@@ -1304,11 +1345,17 @@ impl EbpfCollector {
         process_listener: &Arc<ProcessListener>,
     ) -> Result<Box<Self>> {
         let ebpf_config = config.load();
-        if ebpf_config.ebpf.disabled {
+        let is_ebpf_meltdown = crate::utils::guard::is_kernel_ebpf_meltdown();
+        let is_uprobe_meltdown = crate::utils::guard::is_kernel_ebpf_uprobe_meltdown();
+
+        if ebpf_config.ebpf.disabled || is_ebpf_meltdown {
             info!("ebpf collector disabled.");
             return Err(Error::EbpfDisabled);
         }
-        info!("ebpf collector init...");
+        info!(
+            "ebpf collector init... uprobe_meltdown: {}",
+            is_uprobe_meltdown
+        );
         let queue_name = "0-ebpf-to-ebpf-collector";
         let (sender, receiver, counter) =
             bounded_with_debug(ebpf_config.queue_size, queue_name, queue_debugger);
@@ -1394,14 +1441,16 @@ impl EbpfCollector {
     pub fn on_config_change(&mut self, config: &EbpfConfig) {
         unsafe {
             let ecfg = &config.ebpf.profile;
+            let is_uprobe_meltdown = crate::utils::guard::is_kernel_ebpf_uprobe_meltdown();
             let restart_cprofiler = ebpf::dwarf_available()
                 && ebpf::continuous_profiler_running()
-                && (ebpf::get_dwarf_enabled() != !ecfg.unwinding.dwarf_disabled
+                && ((!is_uprobe_meltdown
+                    && ebpf::get_dwarf_enabled() != !ecfg.unwinding.dwarf_disabled)
                     || ebpf::get_dwarf_process_map_size() as u32
                         != ecfg.unwinding.dwarf_process_map_size
                     || ebpf::get_dwarf_shard_map_size() as u32
                         != ecfg.unwinding.dwarf_shard_map_size);
-            ebpf::set_dwarf_enabled(!ecfg.unwinding.dwarf_disabled);
+            ebpf::set_dwarf_enabled(!is_uprobe_meltdown && !ecfg.unwinding.dwarf_disabled);
             ebpf::set_dwarf_regex(
                 CString::new(ecfg.unwinding.dwarf_regex.as_bytes())
                     .unwrap()

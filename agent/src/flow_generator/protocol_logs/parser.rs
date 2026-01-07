@@ -29,7 +29,7 @@ use arc_swap::access::Access;
 use log::{debug, info};
 use serde::Serialize;
 
-use super::{AppProtoHead, AppProtoLogsBaseInfo, BoxAppProtoLogsData, LogMessageType};
+use super::{AppProtoHead, AppProtoLogsBaseInfo, BoxAppProtoLogsData};
 
 use crate::{
     common::{
@@ -51,6 +51,7 @@ use crate::{
 use public::utils::string::get_string_from_chars;
 use public::{
     chrono_map::ChronoMap,
+    l7_protocol::LogMessageType,
     queue::{self, DebugSender, Receiver},
     throttle::Throttle,
     utils::net::MacAddr,
@@ -194,6 +195,10 @@ impl MetaAppProto {
             base_info.syscall_cap_seq_1 = meta_packet.cap_start_seq as u32;
         }
 
+        if l7_info.is_reversed() {
+            base_info.reverse()
+        }
+
         Some(Self {
             base_info,
             direction: meta_packet.lookup_key.direction,
@@ -230,7 +235,7 @@ impl MetaAppProto {
         //     | 64b flow_id | 24b 0 | 8b proto | 32b cap_seq |
         let mut key = (flow_id as u128) << 64;
 
-        if proto == L7Protocol::Grpc {
+        if proto == L7Protocol::Grpc || proto == L7Protocol::Triple {
             proto = L7Protocol::Http2;
         }
         key |= (proto as u128) << 32;

@@ -17,9 +17,12 @@
 mod consts;
 mod hessian2;
 
-use std::mem::replace;
+use std::{borrow::Cow, mem::replace};
 
 use serde::Serialize;
+
+use public::l7_protocol::{Field, FieldSetter, L7Log, L7LogAttribute, LogMessageType};
+use public_derive::L7Log;
 
 use crate::{
     common::{
@@ -34,13 +37,12 @@ use crate::{
         error::{Error, Result},
         protocol_logs::{
             consts::*,
-            decode_base64_to_string,
             pb_adapter::{
                 ExtendedInfo, KeyVal, L7ProtocolSendLog, L7Request, L7Response, MetricKeyVal,
                 TraceInfo,
             },
             set_captured_byte, swap_if, value_is_default, value_is_negative, AppProtoHead,
-            L7ResponseStatus, LogMessageType, PrioField, PrioFields, BASE_FIELD_PRIORITY,
+            L7ResponseStatus, PrioField, PrioFields, BASE_FIELD_PRIORITY,
             CUSTOM_FIELD_POLICY_PRIORITY, PLUGIN_FIELD_PRIORITY,
         },
     },
@@ -48,10 +50,16 @@ use crate::{
     utils::bytes::{read_u32_be, read_u64_be},
 };
 
-use self::consts::*;
+cfg_if::cfg_if! {
+if #[cfg(feature = "enterprise")] {
+        use enterprise_utils::l7::custom_policy::custom_field_policy::{enums::Op, Store, PolicySlice};
+        use public::l7_protocol::NativeTag;
 
-#[cfg(feature = "enterprise")]
-use enterprise_utils::l7::plugin::custom_field_policy::{set_from_tag, ExtraField};
+        use crate::flow_generator::protocol_logs::{auto_merge_custom_field, consts::APM_SPAN_ID_ATTR};
+    }
+}
+
+use self::consts::*;
 
 const TRACE_ID_MAX_LEN: usize = 1024;
 
@@ -72,7 +80,9 @@ const FASTJSON2_SERIALIZATION_ID: u8 = 23;
 const KRYO_SERIALIZATION2_ID: u8 = 25;
 const CUSTOM_MESSAGE_PACK_ID: u8 = 31;
 
-#[derive(Serialize, Debug, Default, Clone)]
+#[derive(L7Log, Serialize, Debug, Default, Clone)]
+#[l7_log(request_type.skip = "true")]
+#[l7_log(trace_id.getter = "DubboInfo::get_trace_id", trace_id.setter = "DubboInfo::set_trace_id")]
 pub struct DubboInfo {
     #[serde(skip)]
     msg_type: LogMessageType,
@@ -80,6 +90,8 @@ pub struct DubboInfo {
     is_tls: bool,
     #[serde(skip)]
     is_async: bool,
+    #[serde(skip)]
+    is_reversed: bool,
 
     // header
     #[serde(skip)]
@@ -94,12 +106,15 @@ pub struct DubboInfo {
     // req
     #[serde(rename = "request_length", skip_serializing_if = "value_is_negative")]
     pub req_msg_size: Option<u32>,
+    #[l7_log(version)]
     #[serde(rename = "version", skip_serializing_if = "value_is_default")]
     pub dubbo_version: String,
+    #[l7_log(request_domain)]
     #[serde(rename = "request_domain", skip_serializing_if = "value_is_default")]
     pub service_name: String,
     #[serde(skip)]
     pub service_version: String,
+    #[l7_log(request_resource)]
     #[serde(rename = "request_resource", skip_serializing_if = "value_is_default")]
     pub method_name: String,
     #[serde(skip_serializing_if = "value_is_default")]
@@ -110,14 +125,17 @@ pub struct DubboInfo {
     pub span_id: PrioField<String>,
     #[serde(rename = "x_request_id_0", skip_serializing_if = "Option::is_none")]
     pub x_request_id_0: Option<PrioField<String>>,
+    #[l7_log(http_proxy_client)]
     #[serde(rename = "http_proxy_client", skip_serializing_if = "Option::is_none")]
     pub client_ip: Option<String>,
 
     // resp
     #[serde(rename = "response_length", skip_serializing_if = "Option::is_none")]
     pub resp_msg_size: Option<u32>,
+    #[l7_log(response_status)]
     #[serde(rename = "response_status")]
     pub resp_status: L7ResponseStatus,
+    #[l7_log(response_code)]
     #[serde(rename = "response_code", skip_serializing_if = "Option::is_none")]
     pub status_code: Option<i32>,
     #[serde(rename = "x_request_id_1", skip_serializing_if = "Option::is_none")]
@@ -129,7 +147,9 @@ pub struct DubboInfo {
     rrt: u64,
 
     // set by wasm plugin
+    #[l7_log(response_result)]
     custom_result: Option<String>,
+    #[l7_log(response_exception)]
     custom_exception: Option<String>,
 
     #[serde(skip)]
@@ -142,6 +162,22 @@ pub struct DubboInfo {
     is_on_blacklist: bool,
     #[serde(skip)]
     endpoint: Option<String>,
+
+    #[serde(skip_serializing_if = "value_is_default")]
+    biz_type: u8,
+    #[serde(skip_serializing_if = "value_is_default")]
+    biz_code: String,
+    #[serde(skip_serializing_if = "value_is_default")]
+    biz_scenario: String,
+}
+
+impl L7LogAttribute for DubboInfo {
+    fn add_attribute(&mut self, name: Cow<'_, str>, value: Cow<'_, str>) {
+        self.attributes.push(KeyVal {
+            key: name.into_owned(),
+            val: value.into_owned(),
+        });
+    }
 }
 
 impl DubboInfo {
@@ -159,6 +195,9 @@ impl DubboInfo {
         }
         if other.is_async {
             self.is_async = other.is_async;
+        }
+        if other.is_reversed {
+            self.is_reversed = other.is_reversed;
         }
         if other.event > 0 {
             self.event = other.event;
@@ -191,64 +230,48 @@ impl DubboInfo {
         if other.is_on_blacklist {
             self.is_on_blacklist = other.is_on_blacklist;
         }
-    }
-
-    fn parse_trace_id(trace_info: String, trace_type: &TraceType) -> String {
-        if trace_info.is_empty() {
-            return trace_info;
+        if other.biz_type > 0 {
+            self.biz_type = other.biz_type;
         }
-        match trace_type {
-            TraceType::Sw3 => {
-                // sw3: SEGMENTID|SPANID|100|100|#IPPORT|#PARENT_ENDPOINT|#ENDPOINT|TRACEID|SAMPLING
-                let segs: Vec<&str> = trace_info.split("|").collect();
-                if segs.len() > 7 {
-                    segs[7].to_string()
-                } else {
-                    trace_info
-                }
-            }
-            TraceType::Sw8 => {
-                // sw8: 1-TRACEID-SEGMENTID-3-PARENT_SERVICE-PARENT_INSTANCE-PARENT_ENDPOINT-IPPORT
-                let segs: Vec<&str> = trace_info.split("-").collect();
-                if segs.len() > 2 {
-                    decode_base64_to_string(segs[1])
-                } else {
-                    decode_base64_to_string(&trace_info)
-                }
-            }
-            TraceType::CloudWise => {
-                if let Some(trace_id) =
-                    cloud_platform::cloudwise::decode_trace_id(trace_info.as_str())
-                {
-                    trace_id.to_string()
-                } else {
-                    trace_info
-                }
-            }
-            _ => trace_info,
-        }
+        swap_if!(self, biz_code, is_empty, other);
+        swap_if!(self, biz_scenario, is_empty, other);
     }
 
     fn add_trace_id(&mut self, trace_id: String, trace_type: &TraceType) {
-        let id = Self::parse_trace_id(trace_id, &trace_type);
-        if !id.is_empty() && self.copy_apm_trace_id {
+        let id = match trace_type.decode_trace_id(&trace_id) {
+            Some(id) if !id.is_empty() => id,
+            _ => return,
+        };
+        if self.copy_apm_trace_id {
             self.copy_apm_trace_id = false;
             self.attributes.push(KeyVal {
                 key: APM_TRACE_ID_ATTR.to_string(),
-                val: id.clone(),
+                val: id.to_string(),
             });
         }
-        self.trace_ids.merge_field(BASE_FIELD_PRIORITY, id);
+        self.trace_ids
+            .merge_field(BASE_FIELD_PRIORITY, id.to_string());
     }
 
     fn set_span_id(&mut self, span_id: String, trace_type: &TraceType) {
-        if self.span_id.prio <= BASE_FIELD_PRIORITY {
-            return;
-        }
-        self.span_id = match trace_type.decode_span_id(&span_id) {
-            Some(id) => PrioField::new(BASE_FIELD_PRIORITY, id.to_string()),
-            None => PrioField::new(BASE_FIELD_PRIORITY, span_id),
-        }
+        self.span_id.set_with(BASE_FIELD_PRIORITY, || {
+            match trace_type.decode_span_id(&span_id) {
+                Some(id) => id.to_string(),
+                None => span_id,
+            }
+        });
+    }
+
+    // when response_code is overwritten, put it into the attributes.
+    fn response_code_to_attribute(&mut self) {
+        self.attributes.push(KeyVal {
+            key: SYS_RESPONSE_CODE_ATTR.to_string(),
+            val: self
+                .status_code
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        });
     }
 
     pub fn merge_custom_info(&mut self, custom: CustomInfo) {
@@ -263,6 +286,7 @@ impl DubboInfo {
 
         //resp rewrite
         if let Some(code) = custom.resp.code {
+            self.response_code_to_attribute();
             self.status_code = Some(code);
         }
 
@@ -302,6 +326,9 @@ impl DubboInfo {
         if let Some(is_async) = custom.is_async {
             self.is_async = is_async;
         }
+        if let Some(is_reversed) = custom.is_reversed {
+            self.is_reversed = is_reversed;
+        }
     }
 
     fn set_is_on_blacklist(&mut self, config: &LogParserConfig) {
@@ -317,72 +344,17 @@ impl DubboInfo {
         }
     }
 
-    #[cfg(feature = "enterprise")]
-    fn merge_policy_tags_to_dubbo(
-        &mut self,
-        tags: &mut std::collections::HashMap<&'static str, String>,
-    ) {
-        log::debug!("dubbo merge custom policy tags: {:?}", tags);
-        if tags.is_empty() {
-            return;
-        }
-        set_from_tag!(self.dubbo_version, tags, ExtraField::VERSION);
-        // req
-        // request_resource priority greater than request_type, ignore request_type setting
-        // set_from_tag!(self.method_name, tags, ExtraField::REQUEST_TYPE);
-        set_from_tag!(self.service_name, tags, ExtraField::REQUEST_DOMAIN);
-        set_from_tag!(self.method_name, tags, ExtraField::REQUEST_RESOURCE);
-        self.endpoint = tags.remove(ExtraField::ENDPOINT);
+    fn get_trace_id(&self) -> Field {
+        Field::Str(Cow::Borrowed(&self.trace_ids.highest()))
+    }
 
-        if let Some(req_id) = tags.remove(ExtraField::REQUEST_ID) {
-            self.request_id = req_id.parse::<i64>().unwrap_or_default();
-        }
-        if let Some(resp_code) = tags.remove(ExtraField::RESPONSE_CODE) {
-            self.status_code = Some(resp_code.parse::<i32>().unwrap_or_default());
-        }
-
-        // res
-        if let Some(resp_status) = tags.remove(ExtraField::RESPONSE_STATUS) {
-            self.resp_status = L7ResponseStatus::from(resp_status.as_str());
-        }
-        self.custom_exception = tags.remove(ExtraField::RESPONSE_EXCEPTION);
-        self.custom_result = tags.remove(ExtraField::RESPONSE_RESULT);
-
-        // trace info
-        if let Some(trace_id) = tags.remove(ExtraField::TRACE_ID) {
-            self.trace_ids
-                .merge_field(CUSTOM_FIELD_POLICY_PRIORITY, trace_id);
-        }
-
-        if CUSTOM_FIELD_POLICY_PRIORITY < self.span_id.prio {
-            if let Some(span_id) = tags.remove(ExtraField::SPAN_ID) {
-                let prev = replace(
-                    &mut self.span_id,
-                    PrioField::new(CUSTOM_FIELD_POLICY_PRIORITY, span_id),
-                );
-                if !prev.is_default() {
-                    self.attributes.push(KeyVal {
-                        key: APM_SPAN_ID_ATTR.to_string(),
-                        val: prev.into_inner(),
-                    });
-                }
+    fn set_trace_id(&mut self, trace_id: FieldSetter) {
+        let (prio, trace_id) = (trace_id.prio(), trace_id.into_inner());
+        match trace_id {
+            Field::Str(s) => {
+                self.trace_ids.merge_field(prio, s.into_owned());
             }
-        }
-        self.client_ip = tags.remove(ExtraField::HTTP_PROXY_CLIENT);
-
-        let x_req_id = match self.msg_type {
-            LogMessageType::Request => &mut self.x_request_id_0,
-            LogMessageType::Response => &mut self.x_request_id_1,
             _ => return,
-        };
-        let prio_check = match x_req_id.as_ref() {
-            Some(p) => CUSTOM_FIELD_POLICY_PRIORITY < p.prio,
-            _ => true,
-        };
-        if prio_check {
-            if let Some(x_request_id) = tags.remove(ExtraField::X_REQUEST_ID) {
-                *x_req_id = Some(PrioField::new(CUSTOM_FIELD_POLICY_PRIORITY, x_request_id));
-            }
         }
     }
 }
@@ -412,11 +384,17 @@ impl L7ProtocolInfoInterface for DubboInfo {
     }
 
     fn get_endpoint(&self) -> Option<String> {
-        self.endpoint.clone()
+        match L7Log::get_endpoint(self) {
+            Field::Str(s) => Some(s.into_owned()),
+            _ => None,
+        }
     }
 
     fn get_request_domain(&self) -> String {
-        self.service_name.clone()
+        match L7Log::get_request_domain(self) {
+            Field::Str(s) => s.into_owned(),
+            _ => String::new(),
+        }
     }
 
     fn get_request_resource_length(&self) -> usize {
@@ -425,6 +403,10 @@ impl L7ProtocolInfoInterface for DubboInfo {
 
     fn is_on_blacklist(&self) -> bool {
         self.is_on_blacklist
+    }
+
+    fn is_reversed(&self) -> bool {
+        self.is_reversed
     }
 }
 
@@ -468,6 +450,9 @@ impl From<DubboInfo> for L7ProtocolSendLog {
         if f.is_async {
             flags = flags | ApplicationFlags::ASYNC;
         };
+        if f.is_reversed {
+            flags = flags | ApplicationFlags::REVERSED;
+        };
         L7ProtocolSendLog {
             captured_request_byte: f.captured_request_byte,
             captured_response_byte: f.captured_response_byte,
@@ -483,7 +468,11 @@ impl From<DubboInfo> for L7ProtocolSendLog {
             resp: L7Response {
                 status: f.resp_status,
                 code: f.status_code,
-                exception: f.custom_exception.unwrap_or_default(),
+                exception: if f.resp_status != L7ResponseStatus::Ok {
+                    f.custom_exception.unwrap_or_default()
+                } else {
+                    Default::default()
+                },
                 result: f.custom_result.unwrap_or_default(),
             },
             trace_info: Some(TraceInfo {
@@ -519,7 +508,7 @@ impl From<&DubboInfo> for LogCache {
             msg_type: info.msg_type,
             resp_status: info.resp_status,
             on_blacklist: info.is_on_blacklist,
-            endpoint: info.get_endpoint(),
+            endpoint: L7ProtocolInfoInterface::get_endpoint(info),
             ..Default::default()
         }
     }
@@ -528,24 +517,38 @@ impl From<&DubboInfo> for LogCache {
 #[derive(Default)]
 pub struct DubboLog {
     perf_stats: Option<L7PerfStats>,
+
+    #[cfg(feature = "enterprise")]
+    custom_field_store: Store,
+}
+
+#[cfg(feature = "enterprise")]
+struct CustomFieldContext<'a> {
+    direction: PacketDirection,
+    policies: Option<PolicySlice<'a>>,
+    store: &'a mut Store,
 }
 
 impl L7ProtocolParserInterface for DubboLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         if !param.ebpf_type.is_raw_protocol() {
-            return false;
+            return None;
         }
         if param.l4_protocol != IpProtocol::TCP {
-            return false;
+            return None;
         }
 
         let mut header = DubboHeader::default();
         let ret = header.parse_headers(payload);
         if ret.is_err() {
-            return false;
+            return None;
         }
 
-        header.check()
+        if header.check() {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
@@ -555,19 +558,40 @@ impl L7ProtocolParserInterface for DubboLog {
         if self.perf_stats.is_none() && param.parse_perf {
             self.perf_stats = Some(L7PerfStats::default())
         };
+
+        #[cfg(feature = "enterprise")]
+        self.custom_field_store.clear();
+        #[cfg(feature = "enterprise")]
+        let custom_policies = config
+            .l7_log_dynamic
+            .get_custom_field_policies(L7Protocol::Dubbo.into(), param);
+
         let mut info = DubboInfo {
             copy_apm_trace_id: config.l7_log_dynamic.copy_apm_trace_id,
             ..Default::default()
         };
-        self.parse(&config.l7_log_dynamic, payload, &mut info, param)?;
+        self.parse(
+            &config.l7_log_dynamic,
+            payload,
+            &mut info,
+            param.direction,
+            #[cfg(feature = "enterprise")]
+            custom_policies,
+        )?;
         info.is_tls = param.is_tls();
         set_captured_byte!(info, param);
         info.endpoint = info.generate_endpoint();
+
+        #[cfg(feature = "enterprise")]
+        self.merge_custom_field_operations(custom_policies, &mut info);
+
         self.wasm_hook(param, payload, &mut info);
+
         info.set_is_on_blacklist(config);
+
         if let Some(perf_stats) = self.perf_stats.as_mut() {
             if info.msg_type == LogMessageType::Response {
-                if let Some(endpoint) = info.load_endpoint_from_cache(param) {
+                if let Some(endpoint) = info.load_endpoint_from_cache(param, info.is_reversed) {
                     info.endpoint = Some(endpoint.to_string());
                 }
             }
@@ -711,7 +735,7 @@ mod kryo {
             }
 
             decode_span_id(&payload[offset..], &span_type, info);
-            if info.span_id.field.len() != 0 {
+            if info.span_id.get().len() != 0 {
                 break;
             }
         }
@@ -914,7 +938,7 @@ mod fastjson2 {
             }
 
             decode_span_id(&payload[offset..], &span_type, info);
-            if info.span_id.field.len() != 0 {
+            if info.span_id.get().len() != 0 {
                 break;
             }
         }
@@ -922,12 +946,11 @@ mod fastjson2 {
 }
 
 impl DubboLog {
-    fn decode_body(
+    fn decode_req_body(
         config: &L7LogDynamicConfig,
         payload: &[u8],
         info: &mut DubboInfo,
-        #[cfg(feature = "enterprise")] direction: PacketDirection,
-        #[cfg(feature = "enterprise")] port: u16,
+        #[cfg(feature = "enterprise")] cf_ctx: CustomFieldContext<'_>,
     ) {
         match info.serial_id {
             HESSIAN2_SERIALIZATION_ID => hessian2::get_req_body_info(
@@ -935,9 +958,7 @@ impl DubboLog {
                 payload,
                 info,
                 #[cfg(feature = "enterprise")]
-                direction,
-                #[cfg(feature = "enterprise")]
-                port,
+                cf_ctx,
             ),
             KRYO_SERIALIZATION2_ID => kryo::get_req_body_info(config, payload, info),
             KRYO_SERIALIZATION_ID => kryo::get_req_body_info(config, payload, info),
@@ -952,8 +973,8 @@ impl DubboLog {
         payload: &[u8],
         dubbo_header: &DubboHeader,
         info: &mut DubboInfo,
-        #[cfg(feature = "enterprise")] direction: PacketDirection,
-        #[cfg(feature = "enterprise")] port: u16,
+        #[allow(unused_variables)] direction: PacketDirection,
+        #[cfg(feature = "enterprise")] custom_policies: Option<PolicySlice>,
     ) {
         info.msg_type = LogMessageType::Request;
         info.event = dubbo_header.event;
@@ -962,14 +983,16 @@ impl DubboLog {
         info.serial_id = dubbo_header.serial_id;
         info.request_id = dubbo_header.request_id;
 
-        Self::decode_body(
+        Self::decode_req_body(
             config,
             &payload[DUBBO_HEADER_LEN..],
             info,
             #[cfg(feature = "enterprise")]
-            direction,
-            #[cfg(feature = "enterprise")]
-            port,
+            CustomFieldContext {
+                direction,
+                policies: custom_policies,
+                store: &mut self.custom_field_store,
+            },
         );
     }
 
@@ -988,30 +1011,32 @@ impl DubboLog {
         }
     }
 
-    #[cfg(feature = "enterprise")]
     fn decode_resp_body(
         config: &L7LogDynamicConfig,
         payload: &[u8],
         info: &mut DubboInfo,
-        direction: PacketDirection,
-        port: u16,
+        #[cfg(feature = "enterprise")] cf_ctx: CustomFieldContext<'_>,
     ) {
         match info.serial_id {
-            HESSIAN2_SERIALIZATION_ID => {
-                hessian2::get_resp_body_info(config, payload, info, direction, port)
-            }
+            HESSIAN2_SERIALIZATION_ID => hessian2::get_resp_body_info(
+                config,
+                payload,
+                info,
+                #[cfg(feature = "enterprise")]
+                cf_ctx,
+            ),
             _ => {}
         }
     }
 
     fn response(
         &mut self,
+        config: &L7LogDynamicConfig,
+        payload: &[u8],
         dubbo_header: &DubboHeader,
         info: &mut DubboInfo,
-        #[cfg(feature = "enterprise")] config: &L7LogDynamicConfig,
-        #[cfg(feature = "enterprise")] payload: &[u8],
-        #[cfg(feature = "enterprise")] direction: PacketDirection,
-        #[cfg(feature = "enterprise")] port: u16,
+        #[allow(unused_variables)] direction: PacketDirection,
+        #[cfg(feature = "enterprise")] custom_policies: Option<PolicySlice>,
     ) {
         info.msg_type = LogMessageType::Response;
         info.event = dubbo_header.event;
@@ -1022,8 +1047,17 @@ impl DubboLog {
         info.status_code = Some(dubbo_header.status_code as i32);
         self.set_status(dubbo_header.status_code, info);
 
-        #[cfg(feature = "enterprise")]
-        Self::decode_resp_body(config, &payload[DUBBO_HEADER_LEN..], info, direction, port);
+        Self::decode_resp_body(
+            config,
+            &payload[DUBBO_HEADER_LEN..],
+            info,
+            #[cfg(feature = "enterprise")]
+            CustomFieldContext {
+                direction,
+                policies: custom_policies,
+                store: &mut self.custom_field_store,
+            },
+        );
     }
 
     fn parse(
@@ -1031,10 +1065,9 @@ impl DubboLog {
         config: &L7LogDynamicConfig,
         payload: &[u8],
         info: &mut DubboInfo,
-        param: &ParseParam,
+        direction: PacketDirection,
+        #[cfg(feature = "enterprise")] custom_policies: Option<PolicySlice>,
     ) -> Result<()> {
-        let direction = param.direction;
-
         let mut dubbo_header = DubboHeader::default();
         dubbo_header.parse_headers(payload)?;
 
@@ -1045,24 +1078,20 @@ impl DubboLog {
                     payload,
                     &dubbo_header,
                     info,
+                    direction,
                     #[cfg(feature = "enterprise")]
-                    param.direction,
-                    #[cfg(feature = "enterprise")]
-                    param.port_dst,
+                    custom_policies,
                 );
             }
             PacketDirection::ServerToClient => {
                 self.response(
+                    &config,
+                    payload,
                     &dubbo_header,
                     info,
+                    direction,
                     #[cfg(feature = "enterprise")]
-                    &config,
-                    #[cfg(feature = "enterprise")]
-                    payload,
-                    #[cfg(feature = "enterprise")]
-                    param.direction,
-                    #[cfg(feature = "enterprise")]
-                    param.port_src,
+                    custom_policies,
                 );
             }
         }
@@ -1077,6 +1106,56 @@ impl DubboLog {
         let wasm_data = WasmData::new(L7Protocol::Dubbo);
         if let Some(custom) = vm.on_custom_message(payload, param, wasm_data) {
             info.merge_custom_info(custom);
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    fn merge_custom_field_operations(
+        &mut self,
+        policies: Option<PolicySlice>,
+        info: &mut DubboInfo,
+    ) {
+        let Some(policies) = policies else {
+            return;
+        };
+        for op in self.custom_field_store.drain_with(policies, &*info) {
+            match &op.op {
+                Op::RewriteNativeTag(tag, value) => {
+                    match tag {
+                        // request_resource priority greater than request_type
+                        NativeTag::RequestType => {
+                            if info.method_name.is_empty() {
+                                info.method_name = value.to_string();
+                            }
+                        }
+                        // trace info
+                        NativeTag::SpanId => {
+                            if CUSTOM_FIELD_POLICY_PRIORITY < info.span_id.prio() {
+                                let old = std::mem::replace(
+                                    &mut info.span_id,
+                                    PrioField::new(CUSTOM_FIELD_POLICY_PRIORITY, value.to_string()),
+                                );
+                                if !old.is_default() {
+                                    info.attributes.push(KeyVal {
+                                        key: APM_SPAN_ID_ATTR.to_string(),
+                                        val: old.into_inner(),
+                                    });
+                                }
+                            }
+                        }
+                        _ => auto_merge_custom_field(op, info),
+                    }
+                }
+                Op::AddMetric(key, value) => {
+                    info.metrics.push(MetricKeyVal {
+                        key: key.to_string(),
+                        val: *value,
+                    });
+                }
+                // not supported
+                Op::SavePayload(_) => (),
+                _ => auto_merge_custom_field(op, info),
+            }
         }
     }
 }
@@ -1151,19 +1230,6 @@ mod tests {
         common::{flow::PacketDirection, MetaPacket},
         utils::test::Capture,
     };
-
-    cfg_if::cfg_if! {
-    if #[cfg(feature = "enterprise")] {
-            use std::collections::HashMap;
-
-            use enterprise_utils::l7::plugin::custom_field_policy::{ExtraCustomFieldPolicy, ExtraField};
-            use crate::flow_generator::protocol_logs::LogMessageType;
-            use crate::common::flow::L7ProtocolEnum;
-            use crate::config::config::ExtraCustomFieldPolicyMap;
-            use public::segment_map::SegmentBuilder;
-            use public::enums::{FieldType, MatchType};
-        }
-    }
 
     const FILE_DIR: &str = "resources/test/flow_generator/dubbo";
 
@@ -1246,7 +1312,7 @@ mod tests {
             );
             param.set_captured_byte(payload.len());
             param.set_log_parser_config(&config);
-            let is_dubbo = dubbo.check_payload(payload, param);
+            let is_dubbo = dubbo.check_payload(payload, param).is_some();
 
             let i = dubbo.parse_payload(payload, param);
             let info = if let Ok(info) = i {
@@ -1344,7 +1410,7 @@ mod tests {
         );
         param.set_captured_byte(payload.len());
         param.set_log_parser_config(&config);
-        let is_dubbo = dubbo.check_payload(payload, param);
+        let is_dubbo = dubbo.check_payload(payload, param).is_some();
 
         let i = dubbo.parse_payload(payload, param);
         let info = if let Ok(info) = i {
@@ -1361,105 +1427,6 @@ mod tests {
             info.trace_ids.highest(),
             "189d38354fc240ea804c15395b2d5baf.175.17394983574777353"
         );
-    }
-
-    #[test]
-    fn test_cloud_wise() {
-        let packet = [
-            // header
-            0x00u8, 0x16, 0x3e, 0x35, 0x2c, 0x05, 0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0x08, 0x00,
-            0x45, 0x00, 0x0b, 0x48, 0x1e, 0xfe, 0x40, 0x00, 0x40, 0x06, 0x51, 0x1e, 0x64, 0x76,
-            0x3a, 0x08, 0x0a, 0x01, 0x17, 0x15, 0x01, 0xbb, 0x4f, 0x60, 0x9c, 0x06, 0xdf, 0x01,
-            0x71, 0xcc, 0xb3, 0x91, 0x50, 0x10, 0x00, 0x53, 0xca, 0xce, 0x00, 0x00,
-            // dubbo
-            0xda, 0xbb, 0xc2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x15, 0x25, 0x10, 0x00, 0x00,
-            0x03, 0xea, 0x05, 0x32, 0x2e, 0x30, 0x2e, 0x32, 0x30, 0x3d, 0x63, 0x6f, 0x6d, 0x2e,
-            0x62, 0x79, 0x64, 0x2e, 0x64, 0x69, 0x6c, 0x69, 0x6e, 0x6b, 0x2e, 0x64, 0x62, 0x2e,
-            0x76, 0x65, 0x68, 0x69, 0x63, 0x6c, 0x65, 0x2e, 0x61, 0x70, 0x69, 0x2e, 0x73, 0x65,
-            0x72, 0x76, 0x69, 0x63, 0x65, 0x2e, 0x41, 0x75, 0x74, 0x6f, 0x50, 0x69, 0x63, 0x4d,
-            0x6f, 0x64, 0x75, 0x6c, 0x65, 0x64, 0x44, 0x62, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63,
-            0x65, 0x05, 0x30, 0x2e, 0x30, 0x2e, 0x30, 0x09, 0x73, 0x65, 0x6c, 0x65, 0x63, 0x74,
-            0x41, 0x6c, 0x6c, 0x00, 0x48, 0x05, 0x69, 0x6e, 0x70, 0x75, 0x74, 0x03, 0x36, 0x36,
-            0x36, 0x04, 0x70, 0x61, 0x74, 0x68, 0x30, 0x3d, 0x63, 0x6f, 0x6d, 0x2e, 0x62, 0x79,
-            0x64, 0x2e, 0x64, 0x69, 0x6c, 0x69, 0x6e, 0x6b, 0x2e, 0x64, 0x62, 0x2e, 0x76, 0x65,
-            0x68, 0x69, 0x63, 0x6c, 0x65, 0x2e, 0x61, 0x70, 0x69, 0x2e, 0x73, 0x65, 0x72, 0x76,
-            0x69, 0x63, 0x65, 0x2e, 0x41, 0x75, 0x74, 0x6f, 0x50, 0x69, 0x63, 0x4d, 0x6f, 0x64,
-            0x75, 0x6c, 0x65, 0x54, 0x44, 0x62, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x12,
-            0x72, 0x65, 0x6d, 0x6f, 0x74, 0x65, 0x2e, 0x61, 0x70, 0x70, 0x6c, 0x69, 0x63, 0x61,
-            0x74, 0x69, 0x6f, 0x6e, 0x07, 0x76, 0x65, 0x68, 0x69, 0x63, 0x6c, 0x65, 0x09, 0x43,
-            0x4c, 0x4f, 0x55, 0x44, 0x57, 0x49, 0x53, 0x45, 0x30, 0xe8, 0x4a, 0x41, 0x56, 0x41,
-            0x3a, 0x30, 0x3a, 0x36, 0x39, 0x30, 0x34, 0x34, 0x32, 0x34, 0x36, 0x36, 0x36, 0x30,
-            0x35, 0x37, 0x34, 0x36, 0x39, 0x3a, 0x36, 0x38, 0x36, 0x35, 0x35, 0x30, 0x39, 0x35,
-            0x38, 0x38, 0x30, 0x38, 0x39, 0x38, 0x30, 0x32, 0x3a, 0x33, 0x33, 0x36, 0x33, 0x38,
-            0x33, 0x38, 0x35, 0x33, 0x33, 0x33, 0x31, 0x31, 0x38, 0x36, 0x36, 0x3a, 0x30, 0x30,
-            0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x2d, 0x33, 0x33, 0x32, 0x64, 0x2d, 0x33, 0x35,
-            0x31, 0x66, 0x2d, 0x66, 0x66, 0x66, 0x66, 0x2d, 0x66, 0x66, 0x66, 0x66, 0x38, 0x34,
-            0x61, 0x66, 0x62, 0x31, 0x62, 0x61, 0x3a, 0x37, 0x35, 0x30, 0x32, 0x36, 0x31, 0x32,
-            0x33, 0x32, 0x30, 0x31, 0x36, 0x33, 0x30, 0x35, 0x36, 0x3a, 0x30, 0x30, 0x30, 0x30,
-            0x30, 0x30, 0x30, 0x30, 0x2d, 0x33, 0x39, 0x64, 0x37, 0x2d, 0x63, 0x39, 0x62, 0x32,
-            0x2d, 0x66, 0x66, 0x66, 0x66, 0x2d, 0x66, 0x66, 0x66, 0x66, 0x39, 0x33, 0x63, 0x66,
-            0x33, 0x32, 0x65, 0x30, 0x3a, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x2d,
-            0x64, 0x66, 0x33, 0x61, 0x2d, 0x62, 0x66, 0x66, 0x66, 0x2d, 0x30, 0x30, 0x30, 0x30,
-            0x2d, 0x30, 0x30, 0x30, 0x30, 0x30, 0x31, 0x63, 0x34, 0x33, 0x65, 0x66, 0x34, 0x3a,
-            0x64, 0x69, 0x6c, 0x69, 0x6e, 0x6b, 0x61, 0x70, 0x70, 0x5f, 0x64, 0x69, 0x6c, 0x69,
-            0x6e, 0x6b, 0x61, 0x70, 0x70, 0x2d, 0x76, 0x65, 0x68, 0x69, 0x63, 0x6c, 0x65, 0x2d,
-            0x70, 0x72, 0x6f, 0x76, 0x69, 0x64, 0x65, 0x2d, 0x74, 0x65, 0x73, 0x74, 0x3a, 0x2d,
-            0x31, 0x3a, 0x2d, 0x31, 0x0f, 0x73, 0x77, 0x38, 0x2d, 0x63, 0x6f, 0x72, 0x72, 0x65,
-            0x6c, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x00, 0x09, 0x69, 0x6e, 0x74, 0x65, 0x72, 0x66,
-            0x61, 0x63, 0x65,
-        ];
-        let mut meta_packet = MetaPacket::empty();
-        let _ = meta_packet.update(
-            &packet[..],
-            true,
-            true,
-            Duration::from_secs(10),
-            packet.len(),
-        );
-        meta_packet.lookup_key.direction = PacketDirection::ClientToServer;
-        let Some(payload) = meta_packet.get_l4_payload() else {
-            return;
-        };
-
-        let config = LogParserConfig {
-            l7_log_dynamic: L7LogDynamicConfigBuilder {
-                proxy_client: vec![],
-                x_request_id: vec![],
-                trace_types: vec![TraceType::CloudWise],
-                span_types: vec![],
-                ..Default::default()
-            }
-            .into(),
-            ..Default::default()
-        };
-        let mut dubbo = DubboLog::default();
-        let log_cache = Rc::new(RefCell::new(L7PerfCache::new(L7_RRT_CACHE_CAPACITY)));
-        let param = &mut ParseParam::new(
-            &meta_packet,
-            log_cache.clone(),
-            Default::default(),
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            Default::default(),
-            true,
-            true,
-        );
-        param.set_captured_byte(payload.len());
-        param.set_log_parser_config(&config);
-        let is_dubbo = dubbo.check_payload(payload, param);
-
-        let i = dubbo.parse_payload(payload, param);
-        let info = if let Ok(info) = i {
-            match info.unwrap_single() {
-                L7ProtocolInfo::DubboInfo(d) => d,
-                _ => unreachable!(),
-            }
-        } else {
-            DubboInfo::default()
-        };
-
-        assert_eq!(is_dubbo, true);
-        // EE: assert_eq!(info.trace_id, "00000000-332d-351f-ffff-ffff84afb1ba");
-        assert_eq!(info.trace_ids.highest(), "JAVA:0:6904424666057469:6865509588089802:3363838533311866:00000000-332d-351f-ffff-ffff84afb1ba:7502612320163056:00000000-39d7-c9b2-ffff-ffff93cf32e0:ffffffff-df3a-bfff-0000-000001c43ef4:dilinkapp_dilinkapp-vehicle-provide-test:-1:-1");
     }
 
     #[test]
@@ -1558,396 +1525,5 @@ mod tests {
             }
         }
         dubbo.perf_stats.unwrap()
-    }
-
-    #[cfg(feature = "enterprise")]
-    #[test]
-    fn test_parse_hessian2_payload() {
-        let capture = Capture::load_pcap(Path::new(FILE_DIR).join("dubbo-sw8.pcap"));
-        let mut packets = capture.collect::<Vec<_>>();
-        let first_dst_port = packets[0].lookup_key.dst_port;
-        let rewrite_header_fields = vec![
-            ExtraField {
-                field_match_type: MatchType::String(false),
-                field_match_keyword: "path".into(),
-                attribute_name: Some("path".into()),
-                ..Default::default()
-            },
-            ExtraField {
-                field_match_type: MatchType::String(false),
-                field_match_keyword: "remote.application".into(),
-                attribute_name: Some("remote.appliaction".into()),
-                ..Default::default()
-            },
-        ];
-        let mut segment_map_builder = SegmentBuilder::new();
-        segment_map_builder.add_single(20080, 0);
-
-        let config = L7LogDynamicConfig::new(
-            vec![],
-            vec!["x-request-id".into()],
-            true,
-            vec!["trace_id".into()],
-            vec!["span_id".into()],
-            ExtraLogFields::default(),
-            false,
-            HashMap::from([(
-                L7ProtocolEnum::L7Protocol(L7Protocol::Dubbo),
-                ExtraCustomFieldPolicyMap {
-                    policies: vec![ExtraCustomFieldPolicy {
-                        from_req_key: HashMap::from([(
-                            FieldType::DubboHeader,
-                            HashMap::from([
-                                ("path".into(), vec![rewrite_header_fields[0].clone()]),
-                                (
-                                    "remote.application".into(),
-                                    vec![rewrite_header_fields[1].clone()],
-                                ),
-                            ]),
-                        )]),
-                        ..Default::default()
-                    }],
-                    indices: segment_map_builder.merge_segments(),
-                },
-            )]),
-            0,
-            0,
-            0,
-            256,
-        );
-
-        for packet in packets.iter_mut() {
-            if packet.lookup_key.dst_port == first_dst_port {
-                packet.lookup_key.direction = PacketDirection::ClientToServer;
-            } else {
-                packet.lookup_key.direction = PacketDirection::ServerToClient;
-            }
-            let tcp_payload = packet.get_l4_payload().unwrap_or_default();
-            let mut info = DubboInfo::default();
-            hessian2::get_req_body_info(
-                &config,
-                &tcp_payload[DUBBO_HEADER_LEN..],
-                &mut info,
-                PacketDirection::ClientToServer,
-                20080,
-            );
-            assert_eq!(
-                info.service_name, "my.demo.service.ItemService",
-                "get service_name failed"
-            );
-
-            assert!(info.attributes.len() > 0, "get attrs failed");
-            for i in 0..info.attributes.len() {
-                match info.attributes[i].key.as_str() {
-                    "path" => assert_eq!(
-                        "my.demo.service.ItemService", info.attributes[i].val,
-                        "get path failed"
-                    ),
-                    "remote.application" => {
-                        assert_eq!("shop-web", info.attributes[i].val, "get app failed")
-                    }
-                    _ => (),
-                }
-            }
-        }
-    }
-
-    #[cfg(feature = "enterprise")]
-    #[test]
-    fn test_parse_hessian2_payload_with_args() {
-        let hessian_payload = vec![
-            0xda, 0xbb, 0xc2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
-            0x01, 0x7e, 0x05, 0x32, 0x2e, 0x30, 0x2e, 0x32, 0x30, 0x24, 0x6f, 0x72, 0x67, 0x2e,
-            0x61, 0x70, 0x61, 0x63, 0x68, 0x65, 0x2e, 0x64, 0x75, 0x62, 0x62, 0x6f, 0x2e, 0x73,
-            0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x55, 0x73, 0x65, 0x72, 0x50, 0x72, 0x6f, 0x76,
-            0x69, 0x64, 0x65, 0x72, 0x09, 0x6d, 0x79, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e,
-            0x07, 0x47, 0x65, 0x74, 0x55, 0x73, 0x65, 0x72, 0x1e, 0x4c, 0x6f, 0x72, 0x67, 0x2f,
-            0x61, 0x70, 0x61, 0x63, 0x68, 0x65, 0x2f, 0x64, 0x75, 0x62, 0x62, 0x6f, 0x2f, 0x73,
-            0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2f, 0x55, 0x73, 0x65, 0x72, 0x3b, 0x43, 0x1c, 0x6f,
-            0x72, 0x67, 0x2e, 0x61, 0x70, 0x61, 0x63, 0x68, 0x65, 0x2e, 0x64, 0x75, 0x62, 0x62,
-            0x6f, 0x2e, 0x73, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x55, 0x73, 0x65, 0x72, 0x95,
-            0x02, 0x69, 0x64, 0x04, 0x6e, 0x61, 0x6d, 0x65, 0x03, 0x61, 0x67, 0x65, 0x04, 0x74,
-            0x69, 0x6d, 0x65, 0x03, 0x73, 0x65, 0x78, 0x60, 0x03, 0x30, 0x30, 0x33, 0x08, 0x54,
-            0x65, 0x73, 0x74, 0x55, 0x73, 0x65, 0x72, 0xc8, 0x63, 0x4a, 0x00, 0x00, 0x01, 0x97,
-            0x3d, 0xf0, 0xad, 0x8d, 0x43, 0x1e, 0x6f, 0x72, 0x67, 0x2e, 0x61, 0x70, 0x61, 0x63,
-            0x68, 0x65, 0x2e, 0x64, 0x75, 0x62, 0x62, 0x6f, 0x2e, 0x73, 0x61, 0x6d, 0x70, 0x6c,
-            0x65, 0x2e, 0x47, 0x65, 0x6e, 0x64, 0x65, 0x72, 0x91, 0x04, 0x6e, 0x61, 0x6d, 0x65,
-            0x61, 0x03, 0x4d, 0x41, 0x4e, 0x48, 0x09, 0x69, 0x6e, 0x74, 0x65, 0x72, 0x66, 0x61,
-            0x63, 0x65, 0x30, 0x24, 0x6f, 0x72, 0x67, 0x2e, 0x61, 0x70, 0x61, 0x63, 0x68, 0x65,
-            0x2e, 0x64, 0x75, 0x62, 0x62, 0x6f, 0x2e, 0x73, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e,
-            0x55, 0x73, 0x65, 0x72, 0x50, 0x72, 0x6f, 0x76, 0x69, 0x64, 0x65, 0x72, 0x05, 0x67,
-            0x72, 0x6f, 0x75, 0x70, 0x0a, 0x6d, 0x79, 0x41, 0x70, 0x70, 0x47, 0x72, 0x6f, 0x75,
-            0x70, 0x07, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x09, 0x6d, 0x79, 0x76, 0x65,
-            0x72, 0x73, 0x69, 0x6f, 0x6e, 0x07, 0x74, 0x69, 0x6d, 0x65, 0x6f, 0x75, 0x74, 0x04,
-            0x33, 0x30, 0x30, 0x30, 0x05, 0x61, 0x73, 0x79, 0x6e, 0x63, 0x05, 0x66, 0x61, 0x6c,
-            0x73, 0x65, 0x0b, 0x65, 0x6e, 0x76, 0x69, 0x72, 0x6f, 0x6e, 0x6d, 0x65, 0x6e, 0x74,
-            0x03, 0x70, 0x72, 0x6f, 0x04, 0x70, 0x61, 0x74, 0x68, 0x30, 0x24, 0x6f, 0x72, 0x67,
-            0x2e, 0x61, 0x70, 0x61, 0x63, 0x68, 0x65, 0x2e, 0x64, 0x75, 0x62, 0x62, 0x6f, 0x2e,
-            0x73, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x55, 0x73, 0x65, 0x72, 0x50, 0x72, 0x6f,
-            0x76, 0x69, 0x64, 0x65, 0x72, 0x5a,
-        ];
-        let rewrite_hessian2_payload = vec![
-            ExtraField {
-                field_match_type: MatchType::String(false),
-                field_match_keyword: "id".into(),
-                rewrite_native_tag: Some(ExtraField::REQUEST_RESOURCE.into()),
-                attribute_name: Some("id".into()),
-                ..Default::default()
-            },
-            ExtraField {
-                field_match_type: MatchType::String(false),
-                field_match_keyword: "name".into(),
-                rewrite_native_tag: Some(ExtraField::ENDPOINT.into()),
-                attribute_name: Some("name".into()),
-                ..Default::default()
-            },
-            ExtraField {
-                field_match_type: MatchType::String(false),
-                field_match_keyword: "age".into(),
-                rewrite_native_tag: Some(ExtraField::X_REQUEST_ID.into()),
-                attribute_name: Some("age".into()),
-                ..Default::default()
-            },
-        ];
-        let mut segment_map_builder = SegmentBuilder::new();
-        segment_map_builder.add_single(20000, 0);
-
-        let config = L7LogDynamicConfig::new(
-            vec![],
-            vec!["x-request-id".into()],
-            true,
-            vec!["trace_id".into()],
-            vec!["span_id".into()],
-            ExtraLogFields::default(),
-            false,
-            HashMap::from([(
-                L7ProtocolEnum::L7Protocol(L7Protocol::Dubbo),
-                ExtraCustomFieldPolicyMap {
-                    policies: vec![ExtraCustomFieldPolicy {
-                        from_req_key: HashMap::from([(
-                            FieldType::PayloadHessian2,
-                            HashMap::from([
-                                ("id".into(), vec![rewrite_hessian2_payload[0].clone()]),
-                                ("name".into(), vec![rewrite_hessian2_payload[1].clone()]),
-                                ("age".into(), vec![rewrite_hessian2_payload[2].clone()]),
-                            ]),
-                        )]),
-                        ..Default::default()
-                    }],
-                    indices: segment_map_builder.merge_segments(),
-                },
-            )]),
-            0,
-            0,
-            0,
-            256,
-        );
-
-        let mut info = DubboInfo::default();
-        info.msg_type = LogMessageType::Request;
-        hessian2::get_req_body_info(
-            &config,
-            &hessian_payload[DUBBO_HEADER_LEN..],
-            &mut info,
-            PacketDirection::ClientToServer,
-            20000,
-        );
-        assert_eq!(
-            info.endpoint,
-            Some("TestUser".into()),
-            "get endpoint failed"
-        );
-        assert_eq!(
-            info.x_request_id_0.as_ref().unwrap().field,
-            "99",
-            "get x_request_id_0 failed"
-        );
-        assert_eq!(info.method_name, "003", "get method_name failed");
-        assert!(info.attributes.len() > 0, "get attrs failed");
-        for i in 0..info.attributes.len() {
-            match info.attributes[i].key.as_str() {
-                "id" => assert_eq!("003", info.attributes[i].val, "get id failed"),
-                "name" => assert_eq!("TestUser", info.attributes[i].val, "get name failed"),
-                "age" => assert_eq!("99", info.attributes[i].val, "get age failed"),
-                _ => (),
-            }
-        }
-    }
-
-    #[cfg(feature = "enterprise")]
-    #[test]
-    fn test_parse_hessian2_resp_payload() {
-        let hessian_payload = vec![
-            0xda, 0xbb, 0x02, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
-            0x01, 0x8f, 0x94, 0x48, 0x03, 0x72, 0x65, 0x71, 0x43, 0x1c, 0x6f, 0x72, 0x67, 0x2e,
-            0x61, 0x70, 0x61, 0x63, 0x68, 0x65, 0x2e, 0x64, 0x75, 0x62, 0x62, 0x6f, 0x2e, 0x73,
-            0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x55, 0x73, 0x65, 0x72, 0x95, 0x02, 0x69, 0x64,
-            0x04, 0x6e, 0x61, 0x6d, 0x65, 0x03, 0x61, 0x67, 0x65, 0x04, 0x74, 0x69, 0x6d, 0x65,
-            0x03, 0x73, 0x65, 0x78, 0x60, 0x03, 0x31, 0x31, 0x33, 0x06, 0x4d, 0x6f, 0x6f, 0x72,
-            0x73, 0x65, 0xae, 0x4a, 0x00, 0x00, 0x01, 0x99, 0xec, 0x2a, 0x03, 0x63, 0x43, 0x1e,
-            0x6f, 0x72, 0x67, 0x2e, 0x61, 0x70, 0x61, 0x63, 0x68, 0x65, 0x2e, 0x64, 0x75, 0x62,
-            0x62, 0x6f, 0x2e, 0x73, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x47, 0x65, 0x6e, 0x64,
-            0x65, 0x72, 0x91, 0x04, 0x6e, 0x61, 0x6d, 0x65, 0x61, 0x05, 0x57, 0x4f, 0x4d, 0x41,
-            0x4e, 0x04, 0x75, 0x73, 0x65, 0x72, 0x60, 0x03, 0x30, 0x30, 0x31, 0x0a, 0x5a, 0x68,
-            0x61, 0x6e, 0x67, 0x53, 0x68, 0x65, 0x6e, 0x67, 0xa2, 0x4a, 0x00, 0x00, 0x01, 0x99,
-            0xec, 0x2a, 0x03, 0x63, 0x61, 0x03, 0x4d, 0x41, 0x4e, 0x5a, 0x48, 0x05, 0x64, 0x75,
-            0x62, 0x62, 0x6f, 0x05, 0x32, 0x2e, 0x30, 0x2e, 0x32, 0x05, 0x61, 0x73, 0x79, 0x6e,
-            0x63, 0x05, 0x66, 0x61, 0x6c, 0x73, 0x65, 0x09, 0x69, 0x6e, 0x74, 0x65, 0x72, 0x66,
-            0x61, 0x63, 0x65, 0x30, 0x24, 0x6f, 0x72, 0x67, 0x2e, 0x61, 0x70, 0x61, 0x63, 0x68,
-            0x65, 0x2e, 0x64, 0x75, 0x62, 0x62, 0x6f, 0x2e, 0x73, 0x61, 0x6d, 0x70, 0x6c, 0x65,
-            0x2e, 0x55, 0x73, 0x65, 0x72, 0x50, 0x72, 0x6f, 0x76, 0x69, 0x64, 0x65, 0x72, 0x07,
-            0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x09, 0x6d, 0x79, 0x76, 0x65, 0x72, 0x73,
-            0x69, 0x6f, 0x6e, 0x0a, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x2d, 0x61, 0x64, 0x64, 0x72,
-            0x0f, 0x31, 0x32, 0x37, 0x2e, 0x30, 0x2e, 0x30, 0x2e, 0x31, 0x3a, 0x32, 0x30, 0x30,
-            0x30, 0x30, 0x0b, 0x72, 0x65, 0x6d, 0x6f, 0x74, 0x65, 0x2d, 0x61, 0x64, 0x64, 0x72,
-            0x0f, 0x31, 0x32, 0x37, 0x2e, 0x30, 0x2e, 0x30, 0x2e, 0x31, 0x3a, 0x33, 0x35, 0x30,
-            0x34, 0x38, 0x07, 0x74, 0x69, 0x6d, 0x65, 0x6f, 0x75, 0x74, 0x04, 0x33, 0x30, 0x30,
-            0x30, 0x0b, 0x65, 0x6e, 0x76, 0x69, 0x72, 0x6f, 0x6e, 0x6d, 0x65, 0x6e, 0x74, 0x03,
-            0x70, 0x72, 0x6f, 0x04, 0x70, 0x61, 0x74, 0x68, 0x30, 0x24, 0x6f, 0x72, 0x67, 0x2e,
-            0x61, 0x70, 0x61, 0x63, 0x68, 0x65, 0x2e, 0x64, 0x75, 0x62, 0x62, 0x6f, 0x2e, 0x73,
-            0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x55, 0x73, 0x65, 0x72, 0x50, 0x72, 0x6f, 0x76,
-            0x69, 0x64, 0x65, 0x72, 0x05, 0x67, 0x72, 0x6f, 0x75, 0x70, 0x0a, 0x6d, 0x79, 0x41,
-            0x70, 0x70, 0x47, 0x72, 0x6f, 0x75, 0x70, 0x5a, 0x4e,
-        ];
-        let mut config = L7LogDynamicConfig::new(
-            vec![],
-            vec!["x-request-id".into()],
-            true,
-            vec!["trace_id".into()],
-            vec!["span_id".into()],
-            ExtraLogFields::default(),
-            false,
-            HashMap::new(),
-            0,
-            0,
-            0,
-            256,
-        );
-        let rewrite_hessian2_payload = vec![
-            ExtraField {
-                field_match_type: MatchType::String(true),
-                field_match_keyword: "user.name".into(),
-                attribute_name: Some("user.name".into()),
-                ..Default::default()
-            },
-            ExtraField {
-                // should not found
-                field_match_type: MatchType::String(true),
-                field_match_keyword: "user.NAME".into(),
-                attribute_name: Some("user.name".into()),
-                ..Default::default()
-            },
-            ExtraField {
-                field_match_type: MatchType::String(false),
-                field_match_keyword: "user.ID".into(),
-                attribute_name: Some("user.id".into()),
-                ..Default::default()
-            },
-            ExtraField {
-                field_match_type: MatchType::String(false),
-                field_match_keyword: "user.aGe".into(),
-                attribute_name: Some("user.age".into()),
-                ..Default::default()
-            },
-            ExtraField {
-                field_match_type: MatchType::String(false),
-                field_match_keyword: "user".into(),
-                attribute_name: Some("user".into()),
-                ..Default::default()
-            },
-            ExtraField {
-                field_match_type: MatchType::String(false),
-                field_match_keyword: "user.age.sub_key".into(),
-                attribute_name: Some("user.age.sub_key".into()),
-                ..Default::default()
-            },
-            ExtraField {
-                field_match_type: MatchType::String(false),
-                field_match_keyword: "user.key_not_found".into(),
-                attribute_name: Some("user.key_not_found".into()),
-                ..Default::default()
-            },
-        ];
-        let mut segment_map_builder = SegmentBuilder::new();
-        segment_map_builder.add_single(20000, 0);
-        config.extra_field_policies = HashMap::from([(
-            L7ProtocolEnum::L7Protocol(L7Protocol::Dubbo),
-            ExtraCustomFieldPolicyMap {
-                policies: vec![ExtraCustomFieldPolicy {
-                    from_resp_key: HashMap::from([(
-                        FieldType::PayloadHessian2,
-                        HashMap::from([
-                            (
-                                "user.name".into(),
-                                vec![rewrite_hessian2_payload[0].clone()],
-                            ),
-                            ("user.id".into(), vec![rewrite_hessian2_payload[1].clone()]),
-                            ("user.age".into(), vec![rewrite_hessian2_payload[2].clone()]),
-                        ]),
-                    )]),
-                    ..Default::default()
-                }],
-                indices: segment_map_builder.merge_segments(),
-            },
-        )]);
-
-        let mut info = DubboInfo::default();
-        info.msg_type = LogMessageType::Response;
-        hessian2::get_resp_body_info(
-            &config,
-            &hessian_payload[DUBBO_HEADER_LEN..],
-            &mut info,
-            PacketDirection::ServerToClient,
-            20000,
-        );
-        assert_eq!(info.attributes.len(), 3, "get attrs failed");
-        for attr in info.attributes {
-            match attr.key.as_str() {
-                "user.name" => assert_eq!(attr.val, "ZhangSheng".to_string()),
-                "user.id" => assert_eq!(attr.val, "001".to_string()),
-                "user.age" => assert_eq!(attr.val, "18".to_string()),
-                _ => assert!(false),
-            }
-        }
-
-        config.extra_field_policies = HashMap::from([(
-            L7ProtocolEnum::L7Protocol(L7Protocol::Dubbo),
-            ExtraCustomFieldPolicyMap {
-                policies: vec![ExtraCustomFieldPolicy {
-                    from_resp_key: HashMap::from([(
-                        FieldType::PayloadHessian2,
-                        HashMap::from([
-                            ("user".into(), vec![rewrite_hessian2_payload[3].clone()]),
-                            // when key is not exists, get nothing
-                            (
-                                "user.age.sub_key".into(),
-                                vec![rewrite_hessian2_payload[4].clone()],
-                            ),
-                            (
-                                "user.key_not_found".into(),
-                                vec![rewrite_hessian2_payload[5].clone()],
-                            ),
-                        ]),
-                    )]),
-                    ..Default::default()
-                }],
-                indices: segment_map_builder.merge_segments(),
-            },
-        )]);
-
-        let mut info = DubboInfo::default();
-        info.msg_type = LogMessageType::Response;
-        hessian2::get_resp_body_info(
-            &config,
-            &hessian_payload[DUBBO_HEADER_LEN..],
-            &mut info,
-            PacketDirection::ServerToClient,
-            20000,
-        );
-
-        assert_eq!(info.attributes.len(), 1, "get attrs count error");
-        assert_eq!(info.attributes[0].key, "user");
-        assert!(info.attributes[0].val.contains("name"));
-        assert!(info.attributes[0].val.contains("age"));
     }
 }

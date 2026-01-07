@@ -84,11 +84,9 @@ struct __socket_data {
 	__u8 is_tls:1;
 
 	__u64 syscall_len;	// 本次系统调用读、写数据的总长度
-	union {
-		__u64 data_seq;		// cap_data在Socket中的相对顺序号
-		__u32 fd;
-	};
-	__u16 data_type;	// HTTP, DNS, MySQL
+	__u64 data_seq;		// cap_data在Socket中的相对顺序号
+	__u32 fd;
+	__u16 data_type;	// HTTP, DNS, MySQL ...
 	__u16 data_len;		// 数据长度
 	__u8 socket_role;	// this message is created by: 0:unkonwn 1:client(connect) 2:server(accept)
 	char data[BURST_DATA_BUF_SIZE];
@@ -142,7 +140,8 @@ struct socket_info_s {
 	 * participate in tracing.
 	 */
 	__u16 no_trace:1;
-	__u16 unused_bits:11;
+	__u16 data_source:4; // The source of the stored data, defined in the 'enum process_data_extra_source'. 
+	__u16 unused_bits:7;
 	__u32 reasm_bytes;	// The amount of data bytes that have been reassembled.
 
 	/*
@@ -201,6 +200,7 @@ struct tracer_ctx_s {
 	__u32 go_tracing_timeout; /**< Go tracing timeout */
 	__u32 io_event_collect_mode; /**< IO event collection mode */
 	__u64 io_event_minimal_duration; /**< Minimum duration for IO events */
+	bool virtual_file_collect_enabled;    /**< Enable virtual file collection */
 	int push_buffer_refcnt;	/**< Reference count of the data push buffer */
 	__u64 last_period_timestamp; /**< Record the timestamp of the last periodic check of the push buffer. */
 	__u64 period_timestamp;	/**< Record the timestamp of the periodic check of the push buffer. */
@@ -373,7 +373,9 @@ struct member_fields_offset {
 
 	__u16 struct_files_struct_fdt_offset;	// offsetof(struct files_struct, fdt)
 	__u16 struct_file_f_pos_offset;		// offsetof(struct file, f_pos)
-	__u32 struct_files_private_data_offset;	// offsetof(struct file, private_data)
+	__u32 struct_file_private_data_offset;	// offsetof(struct file, private_data)
+	__u32 struct_file_f_op_offset;		// offsetof(struct file, f_op)
+	__u32 struct_file_operations_read_iter_offset; // offsetof(struct file_operations, read_iter)
 	__u32 struct_file_f_inode_offset;	// offsetof(struct file, f_inode)
 	__u32 struct_inode_i_mode_offset;	// offsetof(struct inode, i_mode)
 	__u32 struct_inode_i_sb_offset;		// offsetof(struct inode, i_sb)

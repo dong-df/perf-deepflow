@@ -33,12 +33,13 @@ use crate::{
             NatsInfo, OpenWireInfo, PingInfo, PostgreInfo, PulsarInfo, RedisInfo, RocketmqInfo,
             SofaRpcInfo, TarsInfo, ZmtpInfo,
         },
-        AppProtoHead, LogMessageType, Result,
+        AppProtoHead, Result,
     },
     plugin::CustomInfo,
 };
 
 use super::l7_protocol_log::ParseParam;
+use public::l7_protocol::LogMessageType;
 
 macro_rules! all_protocol_info {
     ($($name:ident($info_struct:ty)),+$(,)?) => {
@@ -129,7 +130,7 @@ cfg_if::cfg_if! {
             SomeIpInfo(crate::flow_generator::protocol_logs::SomeIpInfo),
             PingInfo(PingInfo),
             CustomInfo(CustomInfo),
-            Iso8583Info(crate::flow_generator::protocol_logs::Iso8583Info),
+            Iso8583Info(crate::flow_generator::protocol_logs::rpc::Iso8583Info),
             // add new protocol info below
         );
     }
@@ -161,6 +162,10 @@ where
 
     fn is_tls(&self) -> bool;
 
+    fn is_reversed(&self) -> bool {
+        false
+    }
+
     fn get_endpoint(&self) -> Option<String> {
         None
     }
@@ -191,8 +196,12 @@ where
 
     // load endpoint from cache for *responses*
     // call this before calling `perf_stats` because the latter may remove cached entry
-    fn load_endpoint_from_cache<'a>(&mut self, param: &'a ParseParam) -> Option<String> {
-        let key = LogCacheKey::new(param, self.session_id());
+    fn load_endpoint_from_cache<'a>(
+        &mut self,
+        param: &'a ParseParam,
+        is_reversed: bool,
+    ) -> Option<String> {
+        let key = LogCacheKey::new(param, self.session_id(), is_reversed);
         match param.l7_perf_cache.borrow_mut().rrt_cache.get(&key) {
             Some(cached) if cached.endpoint.is_some() => {
                 let log = LogCache {
@@ -235,6 +244,10 @@ where
                 || self.session_id().is_some() && cur_info.multi_merge_info.is_some()
         );
 
+        if !self.needs_session_aggregation() {
+            return Some(L7PerfStats::from(&cur_info));
+        }
+
         if cur_info.msg_type == LogMessageType::Session {
             if cur_info.on_blacklist {
                 return None;
@@ -254,9 +267,10 @@ where
                 (&mut perf_cache.rrt_cache, &mut perf_cache.timeout_cache)
             },
         );
-        let key = LogCacheKey::new(param, self.session_id());
+        let key = LogCacheKey::new(param, self.session_id(), self.is_reversed());
         let prev_info = rtt_cache.get_mut(&key);
         let timeout_counter = timeout_cache.get_or_insert_mut(param.flow_id);
+        let index = if self.is_reversed() { 1 } else { 0 };
 
         let Some(prev_info) = prev_info else {
             // If the first log is a request and on blacklist, we still need to put it in cache to handle the response,
@@ -265,7 +279,7 @@ where
             // If the first log is a response, it's perf stats will not be counted here.
             // We need to know whether its corresponding request is on blacklist before accounting.
             let ret = if cur_info.msg_type == LogMessageType::Request && !cur_info.on_blacklist {
-                timeout_counter.in_cache += 1;
+                timeout_counter.in_cache[index] += 1;
                 Some(L7PerfStats::from(&cur_info))
             } else {
                 None
@@ -283,7 +297,8 @@ where
             if prev_info.msg_type != cur_info.msg_type && !merge_info.merged {
                 merge_info.merged = true;
                 if !(prev_info.on_blacklist || cur_info.on_blacklist) {
-                    timeout_counter.in_cache = timeout_counter.in_cache.saturating_sub(1);
+                    timeout_counter.in_cache[index] =
+                        timeout_counter.in_cache[index].saturating_sub(1);
                 }
             }
 
@@ -293,7 +308,7 @@ where
             keep_prev = !(merge_info.req_end && merge_info.resp_end);
         } else {
             if prev_info.msg_type == LogMessageType::Request && !prev_info.on_blacklist {
-                timeout_counter.in_cache = timeout_counter.in_cache.saturating_sub(1);
+                timeout_counter.in_cache[index] = timeout_counter.in_cache[index].saturating_sub(1);
             }
         }
 
@@ -307,7 +322,7 @@ where
                 if rrt > param.rrt_timeout as u64 {
                     match prev_info.multi_merge_info.as_ref() {
                         Some(info) if info.merged => (),
-                        _ => timeout_counter.timeout += 1,
+                        _ => timeout_counter.timeout[index] += 1,
                     }
                 } else {
                     perf_stats.update_rrt(rrt);
@@ -335,7 +350,7 @@ where
                         warn!("l7 log info disorder with long time rrt {}", rrt);
                         match prev_info.multi_merge_info.as_ref() {
                             Some(info) if info.merged => (),
-                            _ => timeout_counter.timeout += 1,
+                            _ => timeout_counter.timeout[index] += 1,
                         }
                     }
 
@@ -361,10 +376,10 @@ where
 
             if prev_info.time > cur_info.time {
                 if !cur_info.on_blacklist && cur_info.msg_type == LogMessageType::Request {
-                    timeout_counter.timeout += 1;
+                    timeout_counter.timeout[index] += 1;
                 }
                 if !prev_info.on_blacklist && prev_info.msg_type == LogMessageType::Request {
-                    timeout_counter.in_cache += 1;
+                    timeout_counter.in_cache[index] += 1;
                 }
                 if !cur_info.on_blacklist {
                     Some(L7PerfStats::from(&cur_info))
@@ -373,10 +388,10 @@ where
                 }
             } else {
                 if !prev_info.on_blacklist && prev_info.msg_type == LogMessageType::Request {
-                    timeout_counter.timeout += 1;
+                    timeout_counter.timeout[index] += 1;
                 }
                 if !cur_info.on_blacklist && cur_info.msg_type == LogMessageType::Request {
-                    timeout_counter.in_cache += 1;
+                    timeout_counter.in_cache[index] += 1;
                 }
                 let prev_info = rtt_cache.put(key, cur_info).unwrap();
                 if !prev_info.on_blacklist {
@@ -390,7 +405,7 @@ where
                 && prev_info.msg_type != cur_info.msg_type
                 && !prev_info.multi_merge_info.as_ref().unwrap().merged
             {
-                timeout_counter.timeout += 1;
+                timeout_counter.timeout[index] += 1;
             }
             if !keep_prev {
                 rtt_cache.pop(&key);

@@ -17,7 +17,6 @@
 //! Referfence `gopacket/layers/enums.go`
 
 use std::fmt;
-use std::ops::BitAnd;
 
 use bitflags::bitflags;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
@@ -377,82 +376,81 @@ pub enum LinuxSllPacketType {
     FastRoute = 6, // FastRoute frame
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-pub enum MatchType {
-    // true: ignore case, false(default): case sensitive
-    String(bool),
-    Hex,
-}
-
-impl Default for MatchType {
-    fn default() -> MatchType {
-        MatchType::String(false)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum TrafficDirection {
-    Request = 0x01,
-    Response = 0x10,
-    #[default]
-    Both = 0x11,
+pub enum PacketDirection {
+    ClientToServer = 0,
+    ServerToClient = 1,
 }
 
-impl BitAnd for TrafficDirection {
-    type Output = Self;
-    fn bitand(self, rhs: Self) -> Self::Output {
-        let r = self as u8 & rhs as u8;
-        match r {
-            0x01 => TrafficDirection::Request,
-            0x10 => TrafficDirection::Response,
-            0x11 => TrafficDirection::Both,
-            _ => TrafficDirection::Both,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Charset {
-    Digits,
-    Alphabets,
-    Chinese,
-}
-
-impl Charset {
-    pub fn check(&self, c: &char) -> bool {
+impl PacketDirection {
+    pub fn reversed(&self) -> Self {
         match self {
-            Charset::Digits => c.is_ascii_digit(),
-            Charset::Alphabets => c.is_ascii_alphabetic(),
-            Charset::Chinese => {
-                matches!(*c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{20000}'..='\u{2EBEF}')
-            }
+            PacketDirection::ClientToServer => PacketDirection::ServerToClient,
+            PacketDirection::ServerToClient => PacketDirection::ClientToServer,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, PartialOrd)]
+impl Default for PacketDirection {
+    fn default() -> PacketDirection {
+        PacketDirection::ClientToServer
+    }
+}
+
+impl fmt::Display for PacketDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClientToServer => write!(f, "c2s"),
+            Self::ServerToClient => write!(f, "s2c"),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Copy, Clone, Eq, TryFromPrimitive)]
 #[repr(u8)]
-pub enum FieldType {
+#[serde(rename_all = "snake_case")]
+pub enum L7ResponseStatus {
+    Ok = 0,
+    Timeout = 2,
+    ServerError = 3,
+    ClientError = 4,
     #[default]
-    Header,
-    HttpUrl,
-    // fuzzy search in string like json k-v
-    // it doesn't care if payload can be deserialize as json
-    // try to search "key": "value" string
-    PayloadJson,
-    // fuzzy search in xml string
-    // try to search <key>value</key>, or <root key="value"></root>
-    PayloadXml,
-    // hessian2 payload
-    // used when payload is a hessian2 object, for extract value in object field
-    PayloadHessian2,
-    // in dubbo attachment, it must be a map
-    // fuzzy search in dubbo header
-    DubboHeader,
-    // used when payload is hashmap<string, string> for searching
-    DubboPayloadMapString,
+    Unknown = 5,
+    ParseFailed = 6,
+}
+
+impl fmt::Display for L7ResponseStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl L7ResponseStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Timeout => "timeout",
+            Self::ServerError => "server_error",
+            Self::ClientError => "client_error",
+            Self::ParseFailed => "parse_failed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl From<&str> for L7ResponseStatus {
+    fn from(s: &str) -> Self {
+        match s {
+            "ok" => L7ResponseStatus::Ok,
+            "timeout" => L7ResponseStatus::Timeout,
+            "server_error" => L7ResponseStatus::ServerError,
+            "client_error" => L7ResponseStatus::ClientError,
+            "parse_failed" => L7ResponseStatus::ParseFailed,
+            "unknown" => L7ResponseStatus::Unknown,
+            _ => L7ResponseStatus::Unknown,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -484,5 +482,14 @@ mod tests {
         assert_eq!(size_of::<EthernetType>(), 2);
         assert_eq!(size_of::<IpProtocol>(), 1);
         assert_eq!(size_of::<CaptureNetworkType>(), 2);
+    }
+
+    #[test]
+    fn validate_l7_response_status_as_uint() {
+        assert_eq!(L7ResponseStatus::Ok as u32, 0);
+        assert_eq!(L7ResponseStatus::Timeout as u32, 2);
+        assert_eq!(L7ResponseStatus::ServerError as u32, 3);
+        assert_eq!(L7ResponseStatus::ClientError as u32, 4);
+        assert_eq!(L7ResponseStatus::Unknown as u32, 5);
     }
 }

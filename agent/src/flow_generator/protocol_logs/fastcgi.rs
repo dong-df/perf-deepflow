@@ -16,7 +16,7 @@
 
 use public::bytes::read_u16_be;
 
-use public::l7_protocol::L7Protocol;
+use public::l7_protocol::{L7Protocol, LogMessageType};
 use serde::Serialize;
 
 use crate::common::flow::{L7PerfStats, PacketDirection};
@@ -38,7 +38,7 @@ use super::consts::{
 use super::{
     check_http_method, parse_v1_headers,
     pb_adapter::{ExtendedInfo, L7ProtocolSendLog, L7Request, L7Response, TraceInfo},
-    AppProtoHead, L7ResponseStatus, LogMessageType, PrioField,
+    AppProtoHead, L7ResponseStatus, PrioField,
 };
 
 const FCGI_RECORD_FIX_LEN: usize = 8;
@@ -253,7 +253,7 @@ impl FastCGIInfo {
                 if config.is_span_id(key) {
                     for (i, span) in config.span_types.iter().enumerate() {
                         let prio = i as u8 + BASE_FIELD_PRIORITY;
-                        if self.span_id.prio <= prio {
+                        if self.span_id.prio() <= prio {
                             break;
                         }
                         if !span.check(key) {
@@ -271,7 +271,7 @@ impl FastCGIInfo {
                 };
                 for (i, req_id) in config.x_request_id.iter().enumerate() {
                     let prio = i as u8 + BASE_FIELD_PRIORITY;
-                    if x_req_id.prio <= prio {
+                    if x_req_id.prio() <= prio {
                         break;
                     }
                     if req_id == key {
@@ -447,10 +447,10 @@ impl<'a> Iterator for RecordIter<'a> {
 }
 
 impl L7ProtocolParserInterface for FastCGILog {
-    fn check_payload(&mut self, payload: &[u8], _: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], _: &ParseParam) -> Option<LogMessageType> {
         for (r, p, _) in RecordIter::new(payload) {
             match r.record_type {
-                FCGI_END_REQUEST | FCGI_STDOUT => return false,
+                FCGI_END_REQUEST | FCGI_STDOUT => return None,
                 _ => {}
             }
 
@@ -463,14 +463,14 @@ impl L7ProtocolParserInterface for FastCGILog {
                     )
                     .is_ok()
                     {
-                        return true;
+                        return Some(LogMessageType::Request);
                     }
                 }
-                return false;
+                return None;
             }
         }
 
-        false
+        None
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
@@ -565,7 +565,7 @@ impl L7ProtocolParserInterface for FastCGILog {
         }
         if let Some(perf_stats) = self.perf_stats.as_mut() {
             if info.msg_type == LogMessageType::Response {
-                if let Some(endpoint) = info.load_endpoint_from_cache(param) {
+                if let Some(endpoint) = info.load_endpoint_from_cache(param, false) {
                     info.endpoint = Some(endpoint.to_string());
                 }
             }
@@ -664,12 +664,13 @@ fn get_param_val<'a>(param_payload: &'a [u8], key: &str) -> Result<&'a [u8]> {
 mod test {
     use std::{cell::RefCell, path::Path, rc::Rc};
 
+    use public::l7_protocol::LogMessageType;
+
     use crate::common::flow::{L7PerfStats, PacketDirection};
     use crate::common::l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface};
     use crate::common::l7_protocol_log::{L7PerfCache, L7ProtocolParserInterface, ParseParam};
     use crate::flow_generator::protocol_logs::fastcgi::FastCGILog;
     use crate::flow_generator::protocol_logs::L7ResponseStatus;
-    use crate::flow_generator::LogMessageType;
     use crate::{flow_generator::L7_RRT_CACHE_CAPACITY, utils::test::Capture};
 
     use super::FastCGIInfo;
@@ -736,7 +737,10 @@ mod test {
         );
         let req_payload = p[0].get_l4_payload().unwrap();
         req_param.set_captured_byte(req_payload.len());
-        assert_eq!((&mut parser).check_payload(req_payload, req_param), true);
+        assert_eq!(
+            (&mut parser).check_payload(req_payload, req_param),
+            Some(LogMessageType::Request)
+        );
         let info = (&mut parser).parse_payload(req_payload, req_param).unwrap();
         let mut req = info.unwrap_single();
 
@@ -753,7 +757,7 @@ mod test {
         );
         let resp_payload = p[1].get_l4_payload().unwrap();
         resp_param.set_captured_byte(resp_payload.len());
-        assert_eq!((&mut parser).check_payload(resp_payload, resp_param), false);
+        assert_eq!((&mut parser).check_payload(resp_payload, resp_param), None);
         let mut resp = (&mut parser)
             .parse_payload(resp_payload, resp_param)
             .unwrap()

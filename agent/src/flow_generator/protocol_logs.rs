@@ -25,7 +25,6 @@ pub(crate) mod ping;
 pub(crate) mod plugin;
 pub(crate) mod rpc;
 pub(crate) mod sql;
-use std::collections::HashSet;
 
 pub use self::http::{check_http_method, parse_v1_headers, HttpInfo, HttpLog};
 use self::pb_adapter::L7ProtocolSendLog;
@@ -35,7 +34,6 @@ pub use mq::{
     AmqpInfo, AmqpLog, KafkaInfo, KafkaLog, MqttInfo, MqttLog, NatsInfo, NatsLog, OpenWireInfo,
     OpenWireLog, PulsarInfo, PulsarLog, RocketmqInfo, RocketmqLog, ZmtpInfo, ZmtpLog,
 };
-use num_enum::TryFromPrimitive;
 pub use parser::{AppProto, MetaAppProto, SessionAggregator};
 pub use ping::{PingInfo, PingLog};
 pub use rpc::{
@@ -49,12 +47,10 @@ pub use sql::{
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "enterprise")] {
-        pub mod iso8583;
         pub mod tls;
 
-        pub use iso8583::{Iso8583Info, Iso8583Log};
         pub use mq::{WebSphereMqInfo, WebSphereMqLog};
-        pub use rpc::{SomeIpInfo, SomeIpLog};
+        pub use rpc::{Iso8583Info, Iso8583Log, SomeIpInfo, SomeIpLog};
         pub use sql::{OracleInfo, OracleLog};
         pub use tls::{TlsInfo, TlsLog};
     }
@@ -64,6 +60,8 @@ cfg_if::cfg_if! {
 pub use self::plugin::wasm::{get_wasm_parser, WasmLog};
 
 use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     str,
@@ -83,75 +81,14 @@ use crate::{
     },
     metric::document::TapSide,
 };
+use public::l7_protocol::LogMessageType;
 use public::proto::flow_log;
 use public::sender::{SendMessageType, Sendable};
 use public::utils::net::MacAddr;
 
 const NANOS_PER_MICRO: u64 = 1000;
 
-#[derive(Serialize, Debug, Default, PartialEq, Copy, Clone, Eq, TryFromPrimitive)]
-#[repr(u8)]
-pub enum L7ResponseStatus {
-    Ok = 0,
-    Timeout = 2,
-    ServerError = 3,
-    ClientError = 4,
-    #[default]
-    Unknown = 5,
-    ParseFailed = 6,
-}
-
-impl L7ResponseStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Timeout => "timeout",
-            Self::ServerError => "server_error",
-            Self::ClientError => "client_error",
-            Self::ParseFailed => "parse_failed",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-impl From<&str> for L7ResponseStatus {
-    fn from(s: &str) -> Self {
-        match s {
-            "ok" => L7ResponseStatus::Ok,
-            "timeout" => L7ResponseStatus::Timeout,
-            "server_error" => L7ResponseStatus::ServerError,
-            "client_error" => L7ResponseStatus::ClientError,
-            "parse_failed" => L7ResponseStatus::ParseFailed,
-            "unknown" => L7ResponseStatus::Unknown,
-            _ => L7ResponseStatus::Unknown,
-        }
-    }
-}
-
-#[derive(Serialize, Debug, PartialEq, Eq, Clone, Copy, TryFromPrimitive)]
-#[repr(u8)]
-pub enum LogMessageType {
-    Request,
-    Response,
-    Session,
-    Other,
-    Max,
-}
-
-impl Default for LogMessageType {
-    fn default() -> Self {
-        LogMessageType::Other
-    }
-}
-
-impl From<PacketDirection> for LogMessageType {
-    fn from(d: PacketDirection) -> LogMessageType {
-        match d {
-            PacketDirection::ClientToServer => LogMessageType::Request,
-            PacketDirection::ServerToClient => LogMessageType::Response,
-        }
-    }
-}
+pub use public::enums::L7ResponseStatus;
 
 // 应用层协议原始数据类型
 #[derive(Debug, PartialEq, Copy, Clone, Serialize)]
@@ -418,7 +355,38 @@ impl AppProtoLogsBaseInfo {
             (self.end_time.as_micros() - self.start_time.as_micros()) as u64
         } else {
             0
+        };
+
+        if self.biz_type == 0 {
+            self.biz_type = log.biz_type;
         }
+    }
+
+    fn reverse(&mut self) {
+        std::mem::swap(&mut self.mac_src, &mut self.mac_dst);
+        std::mem::swap(&mut self.ip_src, &mut self.ip_dst);
+        std::mem::swap(&mut self.l3_epc_id_src, &mut self.l3_epc_id_dst);
+        std::mem::swap(&mut self.port_src, &mut self.port_dst);
+        std::mem::swap(&mut self.req_tcp_seq, &mut self.resp_tcp_seq);
+        std::mem::swap(&mut self.gpid_0, &mut self.gpid_1);
+        std::mem::swap(&mut self.process_id_0, &mut self.process_id_1);
+        std::mem::swap(&mut self.process_kname_0, &mut self.process_kname_1);
+        std::mem::swap(
+            &mut self.syscall_trace_id_request,
+            &mut self.syscall_trace_id_response,
+        );
+        std::mem::swap(
+            &mut self.syscall_trace_id_thread_0,
+            &mut self.syscall_trace_id_thread_1,
+        );
+        std::mem::swap(&mut self.syscall_coroutine_0, &mut self.syscall_coroutine_1);
+        std::mem::swap(&mut self.syscall_cap_seq_0, &mut self.syscall_cap_seq_1);
+        std::mem::swap(
+            &mut self.is_vip_interface_src,
+            &mut self.is_vip_interface_dst,
+        );
+        std::mem::swap(&mut self.pod_id_0, &mut self.pod_id_1);
+        self.tap_side.reverse();
     }
 }
 
@@ -560,69 +528,87 @@ const BASE_FIELD_PRIORITY: u8 = 128;
 const CUSTOM_FIELD_POLICY_PRIORITY: u8 = 64;
 const PLUGIN_FIELD_PRIORITY: u8 = 32;
 
-pub struct PrioField<T> {
-    pub prio: u8,
-    pub field: T,
+pub use public::types::PrioField;
+
+#[derive(Clone, Debug)]
+pub enum PrioStrings {
+    Single(PrioField<String>),
+    Multiple(HashMap<String, u8>),
 }
 
-impl<T> PrioField<T> {
-    pub fn new(prio: u8, field: T) -> Self {
-        Self { prio, field }
-    }
-
-    pub fn into_inner(self) -> T {
-        self.field
-    }
-}
-
-impl<T: Clone> Clone for PrioField<T> {
-    fn clone(&self) -> Self {
-        Self {
-            prio: self.prio,
-            field: self.field.clone(),
-        }
-    }
-}
-
-impl<T: fmt::Debug> fmt::Debug for PrioField<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "PrioField {{ prio: {}, field: {:?} }}",
-            self.prio, self.field
-        )
-    }
-}
-
-impl<T: Default + PartialEq> PrioField<T> {
-    pub fn is_default(&self) -> bool {
-        self.field == T::default()
-    }
-}
-
-impl<T: Default> Default for PrioField<T> {
+impl Default for PrioStrings {
     fn default() -> Self {
-        Self {
-            prio: u8::MAX,
-            field: T::default(),
-        }
+        Self::Multiple(Default::default())
     }
 }
 
-impl<T: PartialEq> PartialEq for PrioField<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.prio == other.prio && self.field == other.field
-    }
-}
-
-impl<T: Eq> Eq for PrioField<T> {}
-
-impl<T: Serialize> Serialize for PrioField<T> {
+impl Serialize for PrioStrings {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        self.field.serialize(serializer)
+        match self {
+            Self::Single(field) => field.serialize(serializer),
+            Self::Multiple(_) => {
+                let r = self.clone().into_sorted_vec();
+                r.serialize(serializer)
+            }
+        }
+    }
+}
+
+impl PrioStrings {
+    pub fn new(multi: bool) -> Self {
+        if multi {
+            Self::Multiple(HashMap::new())
+        } else {
+            Self::Single(PrioField::default())
+        }
+    }
+
+    pub fn is_default(&self) -> bool {
+        match self {
+            Self::Single(field) => field.is_default(),
+            Self::Multiple(m) => m.is_empty(),
+        }
+    }
+
+    pub fn push(&mut self, prio: u8, value: Cow<str>) {
+        match self {
+            Self::Single(field) if prio < field.prio() => {
+                *field = PrioField::new(prio, value.into_owned())
+            }
+            Self::Multiple(m) => {
+                if let Some(p) = m.get_mut(value.as_ref()) {
+                    *p = prio.min(*p);
+                } else {
+                    m.insert(value.into_owned(), prio);
+                }
+            }
+            _ => (),
+        }
+    }
+
+    pub fn first(&self) -> Option<&String> {
+        if self.is_default() {
+            return None;
+        }
+        match self {
+            Self::Single(field) => Some(field.get()),
+            Self::Multiple(m) => m.iter().min_by_key(|(_, p)| *p).map(|(k, _)| k),
+        }
+    }
+
+    pub fn into_sorted_vec(self) -> Vec<String> {
+        match self {
+            Self::Single(field) => vec![field.into_inner()],
+            Self::Multiple(m) => {
+                let mut strings = m.into_iter().collect::<Vec<_>>();
+                // smaller is higher priority, sort by ascending order
+                strings.sort_unstable_by_key(|(_, p)| *p);
+                strings.into_iter().map(|(k, _)| k).collect()
+            }
+        }
     }
 }
 
@@ -644,13 +630,13 @@ impl PrioFields {
     // insertion is kept in ascending order by prio; if prio is the same, insert it at the end (stable sort)
     #[inline]
     fn insert_sorted(&mut self, field: PrioField<String>) {
-        if field.field.is_empty() {
+        if field.get().is_empty() {
             return;
         }
         // find the first position greater than it (>), skip those that are equal
-        let pos = match self.0.binary_search_by(|x| x.prio.cmp(&field.prio)) {
+        let pos = match self.0.binary_search_by(|x| x.prio().cmp(&field.prio())) {
             Ok(mut i) => {
-                while i < self.0.len() && self.0[i].prio == field.prio {
+                while i < self.0.len() && self.0[i].prio() == field.prio() {
                     i += 1;
                 }
                 i
@@ -697,8 +683,8 @@ impl PrioFields {
         let mut seen = HashSet::new();
         let mut result = Vec::with_capacity(self.0.len());
         for pf in &self.0 {
-            if seen.insert(&pf.field) {
-                result.push(pf.field.clone());
+            if seen.insert(pf.get()) {
+                result.push(pf.get().clone());
             }
         }
         result
@@ -709,7 +695,7 @@ impl PrioFields {
         let mut result = Vec::with_capacity(3);
 
         for pf in self.0 {
-            let field = pf.field;
+            let field = pf.into_inner();
 
             if result.iter().any(|f| f == &field) {
                 continue;
@@ -726,25 +712,43 @@ impl PrioFields {
     // get first element's priority, or return max
     #[inline]
     pub fn highest_priority(&self) -> u8 {
-        self.0.first().map(|pf| pf.prio).unwrap_or(u8::MAX)
+        self.0.first().map(|pf| pf.prio()).unwrap_or(u8::MAX)
     }
 
     #[inline]
     pub fn highest(&self) -> &str {
-        self.0.first().map(|pf| pf.field.as_str()).unwrap_or("")
+        self.0.first().map(|pf| pf.get().as_str()).unwrap_or("")
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+cfg_if::cfg_if! {
+    if #[cfg(feature = "enterprise")] {
+        use log::warn;
 
-    #[test]
-    fn validate_l7_response_status_as_uint() {
-        assert_eq!(L7ResponseStatus::Ok as u32, 0);
-        assert_eq!(L7ResponseStatus::Timeout as u32, 2);
-        assert_eq!(L7ResponseStatus::ServerError as u32, 3);
-        assert_eq!(L7ResponseStatus::ClientError as u32, 4);
-        assert_eq!(L7ResponseStatus::Unknown as u32, 5);
+        use enterprise_utils::l7::custom_policy::custom_field_policy::enums::{Op, Operation};
+        use public::l7_protocol::{Field, FieldSetter, L7Log, NativeTag};
+
+        use consts::SYS_RESPONSE_CODE_ATTR;
+
+        pub fn auto_merge_custom_field<L: L7Log>(op: Operation, log: &mut L) {
+            let Operation { op, prio } = op;
+            match op {
+                Op::RewriteResponseStatus(status) => log.set_response_status(status),
+                Op::RewriteNativeTag(tag, value) => {
+                    // append to sys_response_code if response_code is not empty
+                    if tag == NativeTag::ResponseCode {
+                        match log.get_response_code() {
+                            Field::Str(s) => log.add_attribute(Cow::Borrowed(SYS_RESPONSE_CODE_ATTR), Cow::Owned(s.to_string())),
+                            Field::Int(i) => log.add_attribute(Cow::Borrowed(SYS_RESPONSE_CODE_ATTR), Cow::Owned(i.to_string())),
+                            Field::None => (),
+                        }
+                    }
+                    let field = FieldSetter::new(CUSTOM_FIELD_POLICY_PRIORITY + prio, value.as_str().into());
+                    log.set(tag, field);
+                }
+                Op::AddAttribute(name, value) => log.add_attribute(Cow::Borrowed(name.as_str()), Cow::Borrowed(value.as_str())),
+                _ => warn!("Ignored operation {op:?} that is not supported by auto custom field merging"),
+            }
+        }
     }
 }

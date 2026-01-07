@@ -30,11 +30,13 @@ use crate::{
         protocol_logs::{
             pb_adapter::{ExtendedInfo, L7ProtocolSendLog, L7Request, L7Response, TraceInfo},
             set_captured_byte, swap_if, value_is_default, value_is_negative, AppProtoHead,
-            L7ResponseStatus, LogMessageType, PrioFields, BASE_FIELD_PRIORITY,
+            L7ResponseStatus, PrioFields, BASE_FIELD_PRIORITY,
         },
     },
     utils::bytes,
 };
+
+use public::l7_protocol::LogMessageType;
 
 #[derive(Serialize, Debug, Default, Clone)]
 pub struct RocketmqInfo {
@@ -66,8 +68,6 @@ pub struct RocketmqInfo {
     pub opaque: u32,
     #[serde(skip)]
     pub ext_queue_id: String,
-    #[serde(skip)]
-    pub req_body: String,
 
     // response
     #[serde(rename = "response_length", skip_serializing_if = "value_is_negative")]
@@ -83,8 +83,6 @@ pub struct RocketmqInfo {
         skip_serializing_if = "value_is_default"
     )]
     pub remark: String,
-    #[serde(rename = "response_result", skip_serializing_if = "value_is_default")]
-    pub resp_body: String,
 
     captured_request_byte: u32,
     captured_response_byte: u32,
@@ -201,7 +199,6 @@ impl RocketmqInfo {
             self.resp_code = other.resp_code;
         }
         swap_if!(self, remark, is_empty, other);
-        swap_if!(self, resp_body, is_empty, other);
         self.captured_response_byte = other.captured_response_byte;
         swap_if!(self, endpoint, is_none, other);
         if other.is_on_blacklist {
@@ -247,7 +244,6 @@ impl From<RocketmqInfo> for L7ProtocolSendLog {
                 status: f.status,
                 code: Some(f.resp_code),
                 exception: f.remark,
-                result: f.resp_body,
                 ..Default::default()
             },
             trace_info: Some(TraceInfo {
@@ -285,11 +281,15 @@ pub struct RocketmqLog {
 }
 
 impl L7ProtocolParserInterface for RocketmqLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         if !param.ebpf_type.is_raw_protocol() {
-            return false;
+            return None;
         }
-        self.check(payload, param.l4_protocol)
+        if self.check(payload, param.l4_protocol) {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
@@ -305,7 +305,7 @@ impl L7ProtocolParserInterface for RocketmqLog {
         }
         if let Some(perf_stats) = self.perf_stats.as_mut() {
             if info.msg_type == LogMessageType::Response {
-                if let Some(endpoint) = info.load_endpoint_from_cache(param) {
+                if let Some(endpoint) = info.load_endpoint_from_cache(param, false) {
                     info.endpoint = Some(endpoint.to_string());
                 }
             }
@@ -366,41 +366,32 @@ impl RocketmqLog {
         if body_offset < 0 {
             return Err(Error::RocketmqLogParseFailed);
         }
-        let header_data_ext_fields = match &header.header_data.ext_fields {
-            Some(ext_fields) => ext_fields.clone(),
-            _ => RocketmqHeaderExtFields::default(),
-        };
+        let mut header_data_ext_fields = header.header_data.ext_fields.take().unwrap_or_default();
         info.version = String::from(header.get_version_str());
         info.opaque = header.header_data.opaque as u32;
-        info.ext_topic = match &header_data_ext_fields.topic {
-            Some(topic) => topic.clone(),
-            _ => String::new(),
-        };
-        info.ext_queue_id = match &header_data_ext_fields.queue_id {
-            Some(queue_id) => queue_id.clone(),
-            _ => String::new(),
-        };
+        info.ext_topic = header_data_ext_fields.topic.take().unwrap_or_default();
+        info.ext_queue_id = header_data_ext_fields.queue_id.take().unwrap_or_default();
         if header.is_request() {
             info.msg_type = LogMessageType::Request;
             info.req_msg_size = Some(header.length as u32);
             info.req_code = header.header_data.code;
             info.req_code_name = String::from(header.get_request_code_str());
-            match &info.req_code_name[..] {
-                "SEND_BATCH_MESSAGE" | "SEND_MESSAGE" | "SEND_MESSAGE_V2" => {
-                    info.ext_group = match &header_data_ext_fields.producer_group {
-                        Some(producer_group) => producer_group.clone(),
-                        _ => String::new(),
-                    };
+            match header.header_data.code {
+                // SEND_BATCH_MESSAGE, SEND_MESSAGE, SEND_MESSAGE_V2
+                320 | 10 | 310 => {
+                    info.ext_group = header_data_ext_fields
+                        .producer_group
+                        .take()
+                        .unwrap_or_default();
                 }
                 // TODO: there are some different but necessary keys corresponding to request code
                 _ => {
-                    info.ext_group = match &header_data_ext_fields.consumer_group {
-                        Some(consumer_group) => consumer_group.clone(),
-                        _ => String::new(),
-                    };
+                    info.ext_group = header_data_ext_fields
+                        .consumer_group
+                        .take()
+                        .unwrap_or_default();
                 }
             }
-            info.req_body = body.body_data.body;
             //  handle oneway requests expecting no response in particular
             if header.is_oneway_request() {
                 info.msg_type = LogMessageType::Session;
@@ -415,11 +406,7 @@ impl RocketmqLog {
             let (resp_code_name, status) = header.get_response_code_str_and_status();
             info.resp_code_name = String::from(resp_code_name);
             info.status = status;
-            info.remark = match &header.header_data.remark {
-                Some(remark) => remark.clone(),
-                _ => String::new(),
-            };
-            info.resp_body = body.body_data.body;
+            info.remark = header.header_data.remark.take().unwrap_or_default();
         }
         info.endpoint = info.generate_endpoint();
 
@@ -427,18 +414,15 @@ impl RocketmqLog {
         if info.msg_type == LogMessageType::Request {
             // for request messages sent by the producer,
             // try to retrieve properties field from ExtFields
-            if let Some(ext_fields) = &header.header_data.ext_fields {
+            if let Some(properties) = header_data_ext_fields.properties.as_ref() {
                 // extract trace info from the properties field within ExtFields
-                if let Some(properties) = &ext_fields.properties {
-                    let (msg_key, trace_ids, span_id) =
-                        parse_trace_info_from_properties(properties);
-                    if let Some(xid) = msg_key {
-                        info.msg_key = xid;
-                    }
-                    info.trace_ids.merge(trace_ids);
-                    if let Some(sid) = span_id {
-                        info.span_id = sid;
-                    }
+                let (msg_key, trace_ids, span_id) = parse_trace_info_from_properties(properties);
+                if let Some(xid) = msg_key {
+                    info.msg_key = xid;
+                }
+                info.trace_ids.merge(trace_ids);
+                if let Some(sid) = span_id {
+                    info.span_id = sid;
                 }
             }
         }
@@ -612,6 +596,10 @@ impl RocketmqHeader {
     }
 
     fn decode_remark(&mut self, data: &[u8]) -> isize {
+        // Check minimum length for reading the length field itself
+        if data.len() < 4 {
+            return -1;
+        }
         let length = bytes::read_i32_be(data);
         if length < 0 || length > data.len() as i32 - 4 {
             return -1;
@@ -625,6 +613,10 @@ impl RocketmqHeader {
     }
 
     fn decode_ext_fields(&mut self, data: &[u8]) -> isize {
+        // Check minimum length for reading the length field itself
+        if data.len() < 4 {
+            return -1;
+        }
         let length = bytes::read_i32_be(data);
         if length < 0 || length > data.len() as i32 - 4 {
             return -1;
@@ -635,6 +627,10 @@ impl RocketmqHeader {
         let mut offset: usize = 4;
         let end_offset = length as usize + 4;
         while offset < end_offset {
+            // Check bounds before reading key_length (2 bytes)
+            if offset + 2 > data.len() {
+                return -1;
+            }
             let key_length = bytes::read_u16_be(&data[offset..(offset + 2)]);
             offset += 2;
             if key_length > (end_offset - offset) as u16 {
@@ -642,6 +638,10 @@ impl RocketmqHeader {
             }
             let key = &data[offset..(offset + key_length as usize)];
             offset += key_length as usize;
+            // Check bounds before reading value_length (4 bytes)
+            if offset + 4 > data.len() {
+                return -1;
+            }
             let value_length = bytes::read_i32_be(&data[offset..(offset + 4)]);
             offset += 4;
             if value_length < 0 || value_length > (end_offset - offset) as i32 {
@@ -1514,10 +1514,11 @@ impl RocketmqHeader {
             16 => ("NO_PERMISSION", L7ResponseStatus::ClientError),
             17 => ("TOPIC_NOT_EXIST", L7ResponseStatus::ClientError),
             18 => ("TOPIC_EXIST_ALREADY", L7ResponseStatus::ClientError),
-            19 => ("PULL_NOT_FOUND", L7ResponseStatus::ClientError),
-            20 => ("PULL_RETRY_IMMEDIATELY", L7ResponseStatus::ClientError),
+            // The following are normal business responses, not errors
+            19 => ("PULL_NOT_FOUND", L7ResponseStatus::Ok), // No new message, consumer caught up
+            20 => ("PULL_RETRY_IMMEDIATELY", L7ResponseStatus::Ok), // Hint to retry immediately
             21 => ("PULL_OFFSET_MOVED", L7ResponseStatus::ClientError),
-            22 => ("QUERY_NOT_FOUND", L7ResponseStatus::ClientError),
+            22 => ("QUERY_NOT_FOUND", L7ResponseStatus::Ok), // Query returned no results
             23 => ("SUBSCRIPTION_PARSE_FAILED", L7ResponseStatus::ClientError),
             24 => ("SUBSCRIPTION_NOT_EXIST", L7ResponseStatus::ClientError),
             25 => ("SUBSCRIPTION_NOT_LATEST", L7ResponseStatus::ClientError),
@@ -1527,8 +1528,8 @@ impl RocketmqHeader {
             ),
             27 => ("FILTER_DATA_NOT_EXIST", L7ResponseStatus::ClientError),
             28 => ("FILTER_DATA_NOT_LATEST", L7ResponseStatus::ClientError),
-            200 => ("TRANSACTION_SHOULD_COMMIT", L7ResponseStatus::ClientError),
-            201 => ("TRANSACTION_SHOULD_ROLLBACK", L7ResponseStatus::ClientError),
+            200 => ("TRANSACTION_SHOULD_COMMIT", L7ResponseStatus::Ok), // Transaction coordination
+            201 => ("TRANSACTION_SHOULD_ROLLBACK", L7ResponseStatus::Ok), // Transaction coordination
             202 => ("TRANSACTION_STATE_UNKNOW", L7ResponseStatus::ServerError),
             203 => (
                 "TRANSACTION_STATE_GROUP_WRONG",
@@ -1538,7 +1539,7 @@ impl RocketmqHeader {
             205 => ("NOT_IN_CURRENT_UNIT", L7ResponseStatus::ClientError),
             206 => ("CONSUMER_NOT_ONLINE", L7ResponseStatus::ServerError),
             207 => ("CONSUME_MSG_TIMEOUT", L7ResponseStatus::ServerError),
-            208 => ("NO_MESSAGE", L7ResponseStatus::ServerError),
+            208 => ("NO_MESSAGE", L7ResponseStatus::Ok), // No message available, normal state
             209 => (
                 "UPDATE_AND_CREATE_ACL_CONFIG_FAILED",
                 L7ResponseStatus::ServerError,
@@ -1635,7 +1636,6 @@ pub struct RocketmqBody {
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct RocketmqBodyData {
-    body: String,
     #[serde(skip)]
     pub properties: Option<String>,
 }
@@ -1662,27 +1662,15 @@ impl RocketmqBody {
         -1
     }
 
-    // directly use the whole json string as body content
+    // Skip body content copy for JSON type - we don't need the full body
+    // for protocol observability, only metadata from header is sufficient
     fn decode_for_json_type(&mut self, data: &[u8]) -> isize {
-        /*
-         * Request Direction:
-         *   clientID
-         *   consumerDataSet
-         *   producerDataSet
-         *
-         * Response Direction:
-         *   brokerDatas
-         *   queueDatas
-         *   filterServerTable
-         *   consumerIdList
-         *   groupList
-         *   topicList
-         */
-        self.body_data.body = String::from_utf8_lossy(data).into_owned();
+        // No longer copy the body data to avoid performance issues with large messages
+        // The metadata we need (topic, group, queue_id, etc.) is in the header
         data.len() as isize
     }
 
-    // only use the body string as body content
+    // Only extract properties for trace info, skip body content to improve performance
     fn decode_for_rocketmq_type(&mut self, data: &[u8]) -> isize {
         /*
          * Response Direction:
@@ -1695,25 +1683,39 @@ impl RocketmqBody {
          *   topicLength(1B), topic(topicLength),
          *   propertiesStrLength(2B), propertiesStr(propertiesLength)
          */
+        // Skip fixed header fields to get to bodyStrLength
         let mut offset: usize = 4 + 4 + 4 + 4 + 4 + 8 + 8 + 4 + 8 + 4 + 4 + 8 + 4 + 4 + 4 + 8;
-        let length = bytes::read_i32_be(&data[offset..(offset + 4)]);
-        offset += 4;
-        if length < 0 || length > (data.len() - offset) as i32 {
+        if offset + 4 > data.len() {
             return -1;
         }
-        self.body_data.body =
-            String::from_utf8_lossy(&data[offset..(offset + length as usize)]).into_owned();
-        offset += length as usize;
+        let body_length = bytes::read_i32_be(&data[offset..(offset + 4)]);
+        offset += 4;
+        if body_length < 0 || body_length > (data.len() - offset) as i32 {
+            return -1;
+        }
+        // Skip body content instead of copying it - this avoids large memory allocations
+        offset += body_length as usize;
 
+        if offset >= data.len() {
+            return -1;
+        }
         let topic_length = data[offset];
         offset += 1;
+        if offset + topic_length as usize > data.len() {
+            return -1;
+        }
         offset += topic_length as usize;
 
+        if offset + 2 > data.len() {
+            return -1;
+        }
         let properties_length = bytes::read_u16_be(&data[offset..(offset + 2)]);
         offset += 2;
         if properties_length > (data.len() - offset) as u16 {
             return -1;
         }
+        // Only copy properties which is needed for trace info extraction
+        // Properties are typically small (a few hundred bytes at most)
         let properties =
             String::from_utf8_lossy(&data[offset..(offset + properties_length as usize)])
                 .into_owned();
@@ -1772,7 +1774,7 @@ mod tests {
             );
             param.set_captured_byte(payload.len());
 
-            let is_rocketmq = rocketmq.check_payload(payload, param);
+            let is_rocketmq = rocketmq.check_payload(payload, param).is_some();
             let info = rocketmq.parse_payload(payload, param);
             if let Ok(info) = info {
                 match info.unwrap_single() {

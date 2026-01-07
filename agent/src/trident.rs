@@ -123,7 +123,7 @@ use packet_sequence_block::BoxedPacketSequenceBlock;
 use pcap_assembler::{BoxedPcapBatch, PcapAssembler};
 
 #[cfg(feature = "enterprise")]
-use enterprise_utils::utils::{kernel_version_check, ActionFlags};
+use enterprise_utils::kernel_version::{kernel_version_check, ActionFlags};
 use public::{
     buffer::BatchedBox,
     debug::QueueDebugger,
@@ -647,8 +647,15 @@ impl Trident {
         } else if action.contains(ActionFlags::MELTDOWN) {
             exception_handler.set(Exception::KernelVersionCircuitBreaker);
             state.melt_down();
-        } else if action.contains(ActionFlags::ALARM) {
+            warn!("kernel check: set MELTDOWN");
+        } else if action.contains(ActionFlags::EBPF_MELTDOWN) {
             exception_handler.set(Exception::KernelVersionCircuitBreaker);
+            // set ebpf_meltdown
+            warn!("kernel check: set EBPF_MELTDOWN");
+        } else if action.contains(ActionFlags::EBPF_UPROBE_MELTDOWN) {
+            exception_handler.set(Exception::KernelVersionCircuitBreaker);
+            // set ebpf_uprobe_meltdown
+            warn!("kernel check: set EBPF_UPROBE_MELTDOWN");
         }
     }
 
@@ -969,6 +976,7 @@ impl Trident {
                         let callbacks = config_handler.on_config(
                             cfg.user_config,
                             &exception_handler,
+                            &stats_collector,
                             None,
                             #[cfg(target_os = "linux")]
                             &api_watcher,
@@ -1049,6 +1057,7 @@ impl Trident {
                     let callbacks = config_handler.on_config(
                         user_config,
                         &exception_handler,
+                        &stats_collector,
                         None,
                         #[cfg(target_os = "linux")]
                         &api_watcher,
@@ -1113,6 +1122,7 @@ impl Trident {
                         .on_config(
                             user_config,
                             &exception_handler,
+                            &stats_collector,
                             Some(components),
                             #[cfg(target_os = "linux")]
                             &api_watcher,
@@ -1161,6 +1171,7 @@ impl Trident {
                     config_handler.on_config(
                         user_config,
                         &exception_handler,
+                        &stats_collector,
                         None,
                         #[cfg(target_os = "linux")]
                         &api_watcher,
@@ -2348,7 +2359,9 @@ impl AgentComponents {
                 .clone(),
         ));
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        platform_synchronizer.set_process_listener(&process_listener);
+        if candidate_config.user_config.inputs.proc.enabled {
+            platform_synchronizer.set_process_listener(&process_listener);
+        }
 
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let (toa_sender, toa_recv, _) = queue::bounded_with_debug(
@@ -2820,7 +2833,10 @@ impl AgentComponents {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let mut ebpf_dispatcher_component = None;
         #[cfg(any(target_os = "linux", target_os = "android"))]
+        let is_kernel_ebpf_meltdown = crate::utils::guard::is_kernel_ebpf_meltdown();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if !config_handler.ebpf().load().ebpf.disabled
+            && !is_kernel_ebpf_meltdown
             && (candidate_config.capture_mode != PacketCaptureType::Analyzer
                 || candidate_config
                     .user_config

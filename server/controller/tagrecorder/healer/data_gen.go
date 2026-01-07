@@ -129,6 +129,10 @@ func newDataGenerator(md metadata.Platform, resourceType string) dataGenerator {
 		dg = newDataGeneratorComponent[metadbModel.ChChost](md, resourceType)
 		filterSubDomain = false
 
+	case tagrecorder.RESOURCE_TYPE_CH_BIZ_SERVICE:
+		dg = newDataGeneratorComponent[metadbModel.ChBizService](md, resourceType)
+		filterSubDomain = false
+
 	case tagrecorder.RESOURCE_TYPE_CH_VPC:
 		dg = newDataGeneratorComponent[metadbModel.ChVPC](md, resourceType)
 		filterSubDomain = false
@@ -333,7 +337,7 @@ func (s *dataGeneratorComponent[GT]) generate() error {
 				q = q.Where("sub_domain_id = ?", s.md.GetSubDomainID())
 			}
 		} else {
-			q = q.Where("domain = ?", s.md.GetDomainLcuuid())
+			q = q.Where(map[string]interface{}{"domain": s.md.GetDomainLcuuid()})
 			if s.filterSubDomain {
 				subDomainLcuuid := s.md.GetSubDomainLcuuid()
 				if subDomainLcuuid != "" {

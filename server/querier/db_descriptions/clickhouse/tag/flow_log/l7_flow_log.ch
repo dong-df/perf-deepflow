@@ -49,6 +49,7 @@ k8s.env                   , K8s Env                  ,
 attribute                 , Attribute                , OpenTelemetry Span 属性，以及应用协议特有属性。
 cloud.tag                 , Cloud Tag                ,
 os.app                    , OS APP                   ,
+biz_service.group         , 服务组                   ,
 
 ip                        , IP 地址                  ,
 is_ipv4                   , IPv4 标志                ,
@@ -67,6 +68,7 @@ l7_protocol               , 应用协议                 ,
 l7_protocol_str           , 应用协议                 , 字符串形式。
 is_tls                    , TLS                      ,
 is_async                  , 异步                     ,
+is_reversed               , 反向                     ,
 version                   , 协议版本                 ,
 type                      , 日志类型                 ,
 request_type              , 请求类型                 ,
@@ -124,4 +126,7 @@ capture_nic_name          , 采集网卡名称             , 当采集位置类�
 capture_nic_type          , 采集网卡类型             , 表示流量采集位置的类型，包括 OTel（应用 Span）、eBPF（Socket Data）、本地网卡（云内流量）、云网关网卡（云网关流量）、分光镜像（传统 IDC 流量）等。
 tap_side                  , 路径统计位置             , 已废弃，请使用 observation_point。
 observation_point         , 观测点                   , 采集位置在流量路径中所处的逻辑位置，例如客户端应用、客户端进程、客户端网卡、客户端容器节点、服务端容器节点、服务端网卡、服务端进程、服务端应用等。
+
 biz_type                  , 业务类型                 ,
+biz_code                  , 业务识别码               , 用于识别业务类型（例如手机银行转账、缴费）。
+biz_scenario              , 业务场景                 , 用于细分业务场景（如本人转本人、本地跨行）。

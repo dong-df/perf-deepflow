@@ -22,9 +22,15 @@
 #include <stdint.h>
 #include "consts.h"
 
+#define LUA_RUNTIME_DETECT_METHOD_LEN 256
+
+#define LUA_RUNTIME_PATH_LEN 1024
+
+#define LUA_RUNTIME_VERSION_LEN 32
+
 #define UNWIND_ENTRIES_PER_SHARD 65535
 
-#define UNWIND_SHARDS_PER_PROCESS 256
+#define UNWIND_SHARDS_PER_PROCESS 1024
 
 enum CfaType {
     CFA_TYPE_RBP_OFFSET,
@@ -43,9 +49,18 @@ enum RegType {
 };
 typedef uint8_t RegType;
 
+typedef struct lua_unwind_table_t lua_unwind_table_t;
+
 typedef struct python_unwind_table_t python_unwind_table_t;
 
 typedef struct unwind_table_t unwind_table_t;
+
+typedef struct {
+    uint32_t kind;
+    uint8_t version[LUA_RUNTIME_VERSION_LEN];
+    uint8_t detection_method[LUA_RUNTIME_DETECT_METHOD_LEN];
+    uint8_t path[LUA_RUNTIME_PATH_LEN];
+} lua_runtime_info_t;
 
 typedef struct {
     uint32_t id;
@@ -57,7 +72,7 @@ typedef struct {
 } shard_info_t;
 
 typedef struct {
-    uint8_t len;
+    uint16_t len;
     shard_info_t entries[UNWIND_SHARDS_PER_PROCESS];
 } process_shard_list_t;
 
@@ -79,6 +94,16 @@ typedef struct {
     uint64_t thread_state_address;
     uint8_t offsets_id;
 } python_unwind_info_t;
+
+typedef struct {
+    uint64_t executor_globals_address;
+    uint64_t jit_return_address;
+    uint64_t execute_ex_start;   // absolute address of execute_ex start
+    uint64_t execute_ex_end;     // absolute address of execute_ex end (exclusive)
+    uint8_t  offsets_id;
+    uint8_t  has_jit;
+    uint8_t  _reserved[6];
+} php_unwind_info_t;
 
 typedef struct {
     int64_t current_frame;
@@ -150,13 +175,194 @@ typedef struct {
     py_type_object_t type_object;
 } python_offsets_t;
 
+typedef struct {
+    uint8_t offsets_id;
+    uint8_t reserved[7];
+    uint64_t state_address;
+} lua_unwind_info_t;
+
+typedef struct {
+    uint32_t features;
+    uint32_t off_l_ci;
+    uint32_t off_l_base_ci;
+    uint32_t off_l_end_ci;
+    uint32_t off_ci_func;
+    uint32_t off_ci_top;
+    uint32_t off_ci_savedpc;
+    uint32_t off_ci_prev;
+    uint32_t off_tvalue_tt;
+    uint32_t off_tvalue_val;
+    uint32_t off_closure_isc;
+    uint32_t off_lclosure_p;
+    uint32_t off_cclosure_f;
+    uint32_t off_proto_source;
+    uint32_t off_proto_linedefined;
+    uint32_t off_proto_code;
+    uint32_t off_proto_sizecode;
+    uint32_t off_proto_lineinfo;
+    uint32_t off_proto_abslineinfo;
+    uint32_t off_tstring_len;
+    uint32_t sizeof_tstring;
+    uint32_t sizeof_callinfo;
+    uint32_t sizeof_tvalue;
+} lua_ofs;
+
+typedef struct {
+    uint8_t fr2;
+    uint8_t gc64;
+    uint16_t pad;
+    uint32_t tv_sz;
+    uint32_t off_l_base;
+    uint32_t off_l_stack;
+    uint32_t off_gcproto_firstline;
+    uint32_t off_gcproto_chunkname;
+    uint32_t off_gcstr_data;
+    uint32_t off_gcfunc_cfunc;
+    uint32_t off_gcfunc_ffid;
+    uint32_t off_gcfunc_pc;
+    uint32_t off_gcproto_bc;
+    uint32_t off_gcstr_len;
+    uint32_t off_l_glref;
+    uint32_t off_global_state_dispatchmode;
+} lj_ofs;
+
+typedef struct {
+    uint16_t current_execute_data;
+} php_executor_globals_t;
+
+typedef struct {
+    uint8_t opline;
+    uint8_t function;
+    uint8_t this_type_info;
+    uint8_t prev_execute_data;
+} php_execute_data_t;
+
+typedef struct {
+    uint8_t common_type;
+    uint8_t common_funcname;
+    uint8_t common_scope;
+    uint32_t op_array_filename;
+    uint32_t op_array_linestart;
+    uint32_t sizeof_struct;
+} php_function_t;
+
+typedef struct {
+    uint64_t val;
+} php_string_t;
+
+typedef struct {
+    uint8_t lineno;
+} php_op_t;
+
+typedef struct {
+    uint64_t name;
+} php_class_entry_t;
+
+typedef struct {
+    php_executor_globals_t executor_globals;
+    php_execute_data_t execute_data;
+    php_function_t function;
+    php_string_t string;
+    php_op_t op;
+    php_class_entry_t class_entry;
+} php_offsets_t;
+
+typedef struct {
+    uint64_t isolate_address;
+    uint8_t offsets_id;
+    uint32_t version;
+} v8_unwind_info_t;
+
+typedef struct {
+    int16_t marker;
+    int16_t function;
+    int16_t bytecode_offset;
+} v8_frame_pointers_t;
+
+typedef struct {
+    uint16_t shared;
+    uint16_t code;
+} v8_js_function_t;
+
+typedef struct {
+    uint16_t name_or_scope_info;
+    uint16_t function_data;
+    uint16_t script_or_debug_info;
+} v8_shared_function_info_t;
+
+typedef struct {
+    uint16_t instruction_start;
+    uint16_t instruction_size;
+    uint16_t flags;
+} v8_code_t;
+
+typedef struct {
+    uint16_t name;
+    uint16_t source;
+} v8_script_t;
+
+typedef struct {
+    uint16_t source_position_table;
+} v8_bytecode_array_t;
+
+typedef struct {
+    v8_frame_pointers_t frame_pointers;
+    v8_js_function_t js_function;
+    v8_shared_function_info_t shared_function_info;
+    v8_code_t code;
+    v8_script_t script;
+    v8_bytecode_array_t bytecode_array;
+} v8_offsets_t;
+
 bool frame_pointer_heuristic_check(uint32_t pid);
 
-bool is_lua_process(uint32_t pid);
+int32_t is_lua_process(uint32_t pid);
 
 bool is_python_process(uint32_t pid);
 
+bool is_php_process(uint32_t pid);
+
+bool is_v8_process(uint32_t pid);
+
+int32_t lua_detect(uint32_t pid, lua_runtime_info_t *out);
+
+char *lua_format_folded_stack_trace(void *tracer,
+                                    uint32_t pid,
+                                    const uint64_t *frames,
+                                    uint32_t frame_count,
+                                    bool new_cache,
+                                    void *info_p,
+                                    const char *err_tag);
+
+void lua_set_map_fds(int32_t lang_flags_fd,
+                     int32_t unwind_info_fd,
+                     int32_t lua_offsets_fd,
+                     int32_t luajit_offsets_fd);
+
+lua_unwind_table_t *lua_unwind_table_create(int32_t lang_flags_fd,
+                                            int32_t unwind_info_fd,
+                                            int32_t lua_offsets_fd,
+                                            int32_t luajit_offsets_fd);
+
+void lua_unwind_table_destroy(lua_unwind_table_t *table);
+
+void lua_unwind_table_load(lua_unwind_table_t *table, uint32_t pid);
+
+void lua_unwind_table_unload(lua_unwind_table_t *table, uint32_t pid);
+
+size_t merge_lua_stacks(void *trace_str, size_t len, const void *u_trace, const void *i_trace);
+
 size_t merge_python_stacks(void *trace_str, size_t len, const void *i_trace, const void *u_trace);
+
+size_t merge_php_stacks(void *trace_str, size_t len, const void *i_trace, const void *u_trace);
+
+size_t merge_v8_stacks(void *trace_str, size_t len, const void *i_trace, const void *u_trace);
+
+char *resolve_php_frame(uint32_t pid, uint64_t zend_function_ptr, uint64_t lineno, uint64_t is_jit);
+
+char *resolve_v8_frame(uint32_t pid, uint64_t pointer_and_type, uint64_t delta_or_marker, uint64_t sfi_fallback);
+
+int32_t protect_cpu_affinity_c(void);
 
 python_unwind_table_t *python_unwind_table_create(int32_t unwind_info_map_fd,
                                                   int32_t offsets_map_fd);
@@ -166,6 +372,27 @@ void python_unwind_table_destroy(python_unwind_table_t *table);
 void python_unwind_table_load(python_unwind_table_t *table, uint32_t pid);
 
 void python_unwind_table_unload(python_unwind_table_t *table, uint32_t pid);
+
+typedef struct php_unwind_table_t php_unwind_table_t;
+
+php_unwind_table_t *php_unwind_table_create(int32_t unwind_info_map_fd,
+                                            int32_t offsets_map_fd);
+
+void php_unwind_table_destroy(php_unwind_table_t *table);
+
+void php_unwind_table_load(php_unwind_table_t *table, uint32_t pid);
+
+void php_unwind_table_unload(php_unwind_table_t *table, uint32_t pid);
+
+typedef struct v8_unwind_table_t v8_unwind_table_t;
+
+v8_unwind_table_t *v8_unwind_table_create(int32_t unwind_info_map_fd);
+
+void v8_unwind_table_destroy(v8_unwind_table_t *table);
+
+void v8_unwind_table_load(v8_unwind_table_t *table, uint32_t pid);
+
+void v8_unwind_table_unload(v8_unwind_table_t *table, uint32_t pid);
 
 int32_t read_offset_of_stack_in_task_struct(void);
 
@@ -182,5 +409,4 @@ void unwind_table_unload(unwind_table_t *table, uint32_t pid);
 
 void unwind_table_unload_all(unwind_table_t *table);
 
-int protect_cpu_affinity_c(void);
-#endif /* TRACE_UTILS_H */
+#endif  /* TRACE_UTILS_H */

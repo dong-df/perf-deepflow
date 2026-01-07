@@ -24,6 +24,8 @@ message AppResponse {
     optional int32 code = 2;
     optional string exception = 3;
     optional string result = 4;
+    optional string type = 5;
+    optional string endpoint = 6;
 }
 
 message AppTrace {
@@ -56,10 +58,14 @@ message AppInfo {
     // a null `is_end` means no need for protocol merge
     optional bool is_end = 21;
     optional bool is_async = 22;
+    // L2 + L3 + L4 + TapSide
+    optional bool is_reversed = 23;
 
     repeated KeyVal attributes = 31;
 
     optional uint32 biz_type = 32;
+    optional string biz_code = 33;
+    optional string biz_scenario = 34;
 }
 
 message NatsMessage {

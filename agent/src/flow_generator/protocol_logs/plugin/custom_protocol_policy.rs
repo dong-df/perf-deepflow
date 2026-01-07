@@ -23,17 +23,18 @@ use crate::{
     flow_generator::{
         protocol_logs::{
             pb_adapter::{KeyVal, MetricKeyVal},
-            set_captured_byte, IpProtocol, L7ResponseStatus, LogMessageType,
+            set_captured_byte, IpProtocol, L7ResponseStatus,
         },
         Error, Result,
     },
     plugin::{CustomInfo, CustomInfoRequest, CustomInfoResp, CustomInfoTrace},
 };
-use enterprise_utils::l7::plugin::custom_protocol_policy::{CustomPolicyInfo, CustomPolicyParser};
-use public::{
+
+use enterprise_utils::l7::custom_policy::{
+    custom_protocol_policy::{CustomPolicyInfo, CustomPolicyParser},
     enums::TrafficDirection,
-    l7_protocol::{CustomProtocol, L7Protocol, L7ProtocolEnum},
 };
+use public::l7_protocol::{CustomProtocol, L7Protocol, LogMessageType};
 
 #[derive(Default)]
 pub struct CustomPolicyLog {
@@ -43,24 +44,24 @@ pub struct CustomPolicyLog {
 }
 
 impl L7ProtocolParserInterface for CustomPolicyLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         if !param.ebpf_type.is_raw_protocol() {
-            return false;
+            return None;
         }
         if param.l4_protocol != IpProtocol::TCP {
-            return false;
+            return None;
         }
         let Some(config) = param.parse_config else {
-            return false;
+            return None;
         };
 
         if config.custom_protocol_config.protocol_characters.is_empty() {
-            return false;
+            return None;
         }
 
         let (port, direction) = match param.direction {
-            PacketDirection::ClientToServer => (param.port_dst, TrafficDirection::Request),
-            PacketDirection::ServerToClient => (param.port_src, TrafficDirection::Response),
+            PacketDirection::ClientToServer => (param.port_dst, TrafficDirection::REQUEST),
+            PacketDirection::ServerToClient => (param.port_src, TrafficDirection::RESPONSE),
         };
 
         match self
@@ -69,10 +70,10 @@ impl L7ProtocolParserInterface for CustomPolicyLog {
         {
             Some(custom_protocol_name) => {
                 self.proto_str = custom_protocol_name;
-                return true;
+                return Some(LogMessageType::Request);
             }
             None => {
-                return false;
+                return None;
             }
         }
     }
@@ -86,29 +87,21 @@ impl L7ProtocolParserInterface for CustomPolicyLog {
             self.perf_stats = Some(L7PerfStats::default())
         };
 
-        let custom_protocol =
-            L7ProtocolEnum::Custom(CustomProtocol::CustomPolicy(self.proto_str.clone()));
+        let protocol = CustomProtocol::CustomPolicy(self.proto_str.clone());
 
-        let (port, direction) = match param.direction {
-            PacketDirection::ClientToServer => (param.port_dst, TrafficDirection::Request),
-            PacketDirection::ServerToClient => (param.port_src, TrafficDirection::Response),
+        let direction = match param.direction {
+            PacketDirection::ClientToServer => TrafficDirection::REQUEST,
+            PacketDirection::ServerToClient => TrafficDirection::RESPONSE,
         };
 
-        let Some(policy) = config
+        let Some(policies) = config
             .l7_log_dynamic
-            .extra_field_policies
-            .get(&custom_protocol)
+            .get_custom_field_policies(protocol.into(), param)
         else {
             return Err(Error::NoParseConfig);
         };
-        let Some(indices) = policy.indices.find(port) else {
-            return Err(Error::NoParseConfig);
-        };
 
-        if self
-            .parser
-            .parse_payload(payload, direction, &policy.policies, indices)
-        {
+        if self.parser.parse_payload(payload, direction, policies) {
             let mut info = CustomInfo::from((&self.parser.info, param.direction));
             info.msg_type = param.direction.into();
             info.proto_str = self.proto_str.clone();
@@ -126,7 +119,7 @@ impl L7ProtocolParserInterface for CustomPolicyLog {
             info.set_is_on_blacklist(config);
             if let Some(perf_stats) = self.perf_stats.as_mut() {
                 if info.msg_type == LogMessageType::Response {
-                    if let Some(endpoint) = info.load_endpoint_from_cache(param) {
+                    if let Some(endpoint) = info.load_endpoint_from_cache(param, false) {
                         info.req.endpoint = endpoint.to_string();
                     }
                 }
@@ -188,6 +181,8 @@ impl From<(&CustomPolicyInfo, PacketDirection)> for CustomInfo {
                 code: info.response_code.clone(),
                 exception: info.response_exception.clone(),
                 result: info.response_result.clone(),
+                endpoint: info.endpoint.clone(),
+                req_type: info.request_type.clone(),
             },
             trace: CustomInfoTrace {
                 trace_ids,

@@ -56,8 +56,9 @@ static enum linux_kernel_type g_k_type;
 static bool use_kfunc_bin;		// Whether to use fentry/fexit binary eBPF bytecode
 static struct list_head events_list;	// Use for extra register events
 static pthread_t proc_events_pthread;	// Process exec/exit thread
-static bool kprobe_feature_disable;	// Whether to disable the kprobe feature.
-static bool unix_socket_feature_enable; // Whether to enable the kprobe feature.
+static bool kprobe_feature_disable;	// Whether to disable the kprobe feature?
+static bool unix_socket_feature_enable; // Whether to enable the kprobe feature?
+static bool virtual_file_collect_enable; // Whether to enable virtual file collect?
 /*
  * Control whether to disable the tracing feature.
  * 'true' disables the tracing feature, and 'false' enables it.
@@ -688,6 +689,42 @@ static int socktrace_sockopt_get(sockoptid_t opt, const void *conf, size_t size,
 	struct bpf_offset_param_array *array = &params->offset_array;
 	array->count = sys_cpus_count;
 
+	// Fetch socket Information from eBPF map
+	struct ebpf_map *map =
+	    ebpf_obj__get_map_by_name(t->obj, MAP_SOCKET_INFO_NAME);
+	if (map == NULL) {
+		ebpf_warning("[%s] map(name:%s) is NULL.\n", __func__,
+			     MAP_SOCKET_INFO_NAME);
+	}
+	int map_fd = map->fd;
+	struct socktrace_msg *msg = (struct socktrace_msg *)conf;
+	if (size != sizeof(*msg)) {
+		ebpf_warning("The parameter 'socktrace_msg' is passed"
+			     "incorrectly with a size mismatch. The passed"
+			     " size is %d, while the actual structure length"
+			     " is %d.\n", size, sizeof(*msg));
+		return -1;
+	}
+	uint64_t conn_key = (uint64_t)msg->pid << 32 | msg->fd;
+	struct socket_info_s info;
+	if (bpf_lookup_elem(map_fd, &conn_key, &info) == 0) {
+		params->socket_id = info.uid;
+		params->seq = info.seq;
+		params->l7_proto = info.l7_proto;
+		params->data_source = info.data_source;
+		params->direction = info.direction;
+		params->pre_direction = info.pre_direction;
+		params->is_tls = info.is_tls;
+		params->peer_fd = info.peer_fd;
+		params->prev_data_len = info.prev_data_len;
+		params->allow_reassembly = info.allow_reassembly;
+		params->finish_reasm = info.finish_reasm;
+		params->force_reasm = info.force_reasm;
+		params->no_trace = info.no_trace;
+		params->reasm_bytes = info.reasm_bytes;
+		params->update_time = info.update_time;
+	}
+
 	params->kern_socket_map_max = conf_max_socket_entries;
 	params->kern_trace_map_max = conf_max_trace_entries;
 	params->tracer_state = t->state;
@@ -908,13 +945,11 @@ static void process_event(struct process_event_t *e)
 		}
 
 		update_proc_info_cache(e->pid, PROC_EXEC);
-		unwind_process_exec(e->pid);
 		extended_process_exec(e->pid);
 	} else if (e->meta.event_type == EVENT_TYPE_PROC_EXIT) {
 		/* Cache for updating process information used in
 		 * symbol resolution. */
 		update_proc_info_cache(e->pid, PROC_EXIT);
-		unwind_process_exit(e->pid);
 		extended_process_exit(e->pid);
 	}
 }
@@ -1188,6 +1223,7 @@ static void reader_raw_cb(void *cookie, void *raw, int raw_size)
 
 		submit_data->timestamp = sd->timestamp;
 		submit_data->direction = sd->direction;
+		submit_data->fd = sd->fd;
 		submit_data->source = sd->source;
 		submit_data->cap_data =
 		    (char *)((void **)&submit_data->cap_data + 1);
@@ -1676,37 +1712,45 @@ static int update_offset_map_default(struct bpf_tracer *t,
 	switch (kern_type) {
 	case K_TYPE_VER_3_10:
 		offset.struct_files_struct_fdt_offset = 0x8;
-		offset.struct_files_private_data_offset = 0xa8;
+		offset.struct_file_private_data_offset = 0xa8;
 		offset.struct_file_f_pos_offset = 0x68;
 		offset.struct_ns_common_inum_offset = 0x4;
 		break;
 	case K_TYPE_KYLIN:
 		offset.struct_files_struct_fdt_offset = 0x20;
-		offset.struct_files_private_data_offset = 0xc0;
+		offset.struct_file_private_data_offset = 0xc0;
 		offset.struct_file_f_pos_offset = 0x60;
 		offset.struct_ns_common_inum_offset = 0x10;
 		break;
 	default:
 		offset.struct_files_struct_fdt_offset = 0x20;
-		offset.struct_files_private_data_offset = 0xc8;
+		offset.struct_file_private_data_offset = 0xc8;
 		offset.struct_file_f_pos_offset = 0x68;
 		offset.struct_ns_common_inum_offset = 0x10;
 	};
 
 	/*
 	 * In Tencent Linux (4.14.105-1-tlinux3-0023.1), there is a difference in
-	 * `struct_files_private_data_offset`. If the offset value of the generic
+	 * `struct_file_private_data_offset`. If the offset value of the generic
 	 * eBPF program is used, it will result in the kernel being unable to adapt.
 	 * A separate correction is made here.
 	 */
 	if (strstr(linux_release, "tlinux3"))
-		offset.struct_files_private_data_offset = 0xc0;
+		offset.struct_file_private_data_offset = 0xc0;
 
 	// For 4.19.90-2211.5.0.0178.22.uel20.x86_64
 	if (strstr(linux_release, "uel20"))
-		offset.struct_files_private_data_offset = 0xc0;
+		offset.struct_file_private_data_offset = 0xc0;
 
-	offset.struct_file_f_inode_offset = 0x20;
+	/*
+	 * The corresponding offset is used to access `file->f_op->read_iter`, which
+	 * is then used to determine whether the file belongs to a standard VFS
+	 * filesystem or is a virtual file.
+	 */
+	offset.struct_file_f_op_offset = 0x28;
+	offset.struct_file_operations_read_iter_offset = 0x20;
+
+	offset.struct_file_f_inode_offset = 0x20;	
 	offset.struct_inode_i_mode_offset = 0x0;
 	offset.struct_inode_i_sb_offset = 0x28;
 	offset.struct_super_block_s_dev_offset = 0x10;
@@ -1782,8 +1826,12 @@ static int update_offset_map_from_btf_vmlinux(struct bpf_tracer *t)
 
 	int struct_files_struct_fdt_offset =
 	    kernel_struct_field_offset(obj, "files_struct", "fdt");
-	int struct_files_private_data_offset =
+	int struct_file_private_data_offset =
 	    kernel_struct_field_offset(obj, "file", "private_data");
+	int struct_file_f_op_offset =
+	    kernel_struct_field_offset(obj, "file", "f_op");
+	int struct_file_operations_read_iter_offset =
+	    kernel_struct_field_offset(obj, "file_operations", "read_iter");
 	int struct_file_f_inode_offset =
 	    kernel_struct_field_offset(obj, "file", "f_inode");
 	int struct_file_f_pos_offset =
@@ -1850,7 +1898,9 @@ static int update_offset_map_from_btf_vmlinux(struct bpf_tracer *t)
 	    kernel_struct_field_offset(obj, "mount", "mnt_id");
 	if (copied_seq_offs < 0 || write_seq_offs < 0 || files_offs < 0 ||
 	    sk_flags_offs < 0 || struct_files_struct_fdt_offset < 0 ||
-	    struct_files_private_data_offset < 0 ||
+	    struct_file_private_data_offset < 0 ||
+	    struct_file_f_op_offset < 0 ||
+	    struct_file_operations_read_iter_offset < 0 ||
 	    struct_file_f_inode_offset < 0 || struct_inode_i_mode_offset < 0 ||
 	    struct_inode_i_sb_offset < 0 || 
 	    struct_super_block_s_dev_offset < 0 || struct_file_dentry_offset < 0 ||
@@ -1875,8 +1925,12 @@ static int update_offset_map_from_btf_vmlinux(struct bpf_tracer *t)
 	ebpf_info("    sk_flags_offs: 0x%x\n", sk_flags_offs);
 	ebpf_info("    struct_files_struct_fdt_offset: 0x%x\n",
 		  struct_files_struct_fdt_offset);
-	ebpf_info("    struct_files_private_data_offset: 0x%x\n",
-		  struct_files_private_data_offset);
+	ebpf_info("    struct_file_private_data_offset: 0x%x\n",
+		  struct_file_private_data_offset);
+	ebpf_info("    struct_file_f_op_offset: 0x%x\n",
+		  struct_file_f_op_offset);
+	ebpf_info("    struct_file_operations_read_iter_offset: 0x%x\n",
+		  struct_file_operations_read_iter_offset);
 	ebpf_info("    struct_file_f_inode_offset: 0x%x\n",
 		  struct_file_f_inode_offset);
 	ebpf_info("    struct_file_f_pos_offset: 0x%x\n",
@@ -1943,8 +1997,11 @@ static int update_offset_map_from_btf_vmlinux(struct bpf_tracer *t)
 	offset.tcp_sock__copied_seq_offset = copied_seq_offs;
 	offset.tcp_sock__write_seq_offset = write_seq_offs;
 	offset.struct_files_struct_fdt_offset = struct_files_struct_fdt_offset;
-	offset.struct_files_private_data_offset =
-	    struct_files_private_data_offset;
+	offset.struct_file_private_data_offset =
+	    struct_file_private_data_offset;
+	offset.struct_file_f_op_offset = struct_file_f_op_offset;
+	offset.struct_file_operations_read_iter_offset =
+	    struct_file_operations_read_iter_offset;
 	offset.struct_file_f_inode_offset = struct_file_f_inode_offset;
 	offset.struct_file_f_pos_offset = struct_file_f_pos_offset;
 	offset.struct_inode_i_mode_offset = struct_inode_i_mode_offset;
@@ -2005,8 +2062,12 @@ static void display_kern_offsets(bpf_offset_param_t * offset)
 		  offset->struct_files_struct_fdt_offset);
 	ebpf_info("\tstruct_file_f_pos_offset: 0x%x\n",
 		  offset->struct_file_f_pos_offset);
-	ebpf_info("\tstruct_files_private_data_offset: 0x%x\n",
-		  offset->struct_files_private_data_offset);
+	ebpf_info("\tstruct_file_private_data_offset: 0x%x\n",
+		  offset->struct_file_private_data_offset);
+	ebpf_info("\tstruct_file_f_op_offset: 0x%x\n",
+		  offset->struct_file_f_op_offset);
+	ebpf_info("\tstruct_file_operations_read_iter_offset: 0x%x\n",
+		  offset->struct_file_operations_read_iter_offset);
 	ebpf_info("\tstruct_file_f_inode_offset: 0x%x\n",
 		  offset->struct_file_f_inode_offset);
 	ebpf_info("\tstruct_inode_i_mode_offset: 0x%x\n",
@@ -2212,8 +2273,8 @@ static inline int __set_data_limit_max(int limit_size)
 
 /**
  * Set maximum amount of data passed to the agent by eBPF programe.
- * @limit_size : The maximum length of data. If @limit_size exceeds 8192,
- *               it will automatically adjust to 8192 bytes.
+ * @limit_size : The maximum length of data. If @limit_size exceeds 16384,
+ *               it will automatically adjust to 16384 bytes.
  *               If limit_size is 0, Use the default values 4096.
  *
  * @return the set maximum buffer size value on success, < 0 on failure.
@@ -2319,6 +2380,7 @@ int set_io_event_collect_mode(uint32_t mode)
 		return ETR_UPDATE_MAP_FAILD;
 	}
 
+	ebpf_info("Set io_event_collect_mode %d\n", io_event_collect_mode);
 	return 0;
 }
 
@@ -2352,6 +2414,42 @@ int set_io_event_minimal_duration(uint64_t duration)
 		return ETR_UPDATE_MAP_FAILD;
 	}
 
+	ebpf_info("Set io_event_minimal_duration %llu ns\n", io_event_minimal_duration);
+	return 0;
+}
+
+int set_virtual_file_collect(bool enabled)
+{
+	virtual_file_collect_enable = enabled;
+
+	struct bpf_tracer *tracer = find_bpf_tracer(SK_TRACER_NAME);
+	if (tracer == NULL) {
+		return 0;
+	}
+
+	int cpu;
+	int nr_cpus = get_num_possible_cpus();
+	struct tracer_ctx_s values[nr_cpus];
+	memset(values, 0, sizeof(values));
+
+	if (!bpf_table_get_value(tracer, MAP_TRACER_CTX_NAME, 0, values)) {
+		ebpf_warning("Get map '%s' failed.\n", MAP_TRACER_CTX_NAME);
+		return ETR_NOTEXIST;
+	}
+
+	for (cpu = 0; cpu < nr_cpus; cpu++) {
+		values[cpu].virtual_file_collect_enabled =
+					virtual_file_collect_enable;
+	}
+
+	if (!bpf_table_set_value
+	    (tracer, MAP_TRACER_CTX_NAME, 0, (void *)&values)) {
+		ebpf_warning("Set '%s' failed\n", MAP_TRACER_CTX_NAME);
+		return ETR_UPDATE_MAP_FAILD;
+	}
+
+	ebpf_info("IO event virtual_file_collect_enable set to %s\n",
+		   virtual_file_collect_enable ? "true" : "false");
 	return 0;
 }
 
@@ -2699,7 +2797,7 @@ static void reconfig_load_resources(struct bpf_tracer *tracer, char *load_name,
  *     in data processing, at the same time, it is also the number of threads reading the
  *     perf buffer.
  * @perf_pages_cnt
- *     Number of page frames with kernel shared memory footprint, the value is a power of 2.
+ *     Number of page frames with kernel shared memory footprint, the value is a power of 2, with page frame size of 4 KB.
  * @queue_size
  *     Ring cache queue size. The value is a power of 2.
  * @max_socket_entries
@@ -2886,6 +2984,7 @@ int running_socket_tracer(tracer_callback_t handle,
 		t_conf[cpu].io_event_collect_mode = io_event_collect_mode;
 		t_conf[cpu].io_event_minimal_duration =
 		    io_event_minimal_duration;
+		t_conf[cpu].virtual_file_collect_enabled = virtual_file_collect_enable;
 		t_conf[cpu].disable_tracing = g_disable_syscall_tracing;
 		if (!g_disable_syscall_tracing)
 			t_conf[cpu].go_tracing_timeout = go_tracing_timeout;
@@ -2894,6 +2993,13 @@ int running_socket_tracer(tracer_callback_t handle,
 	if (!bpf_table_set_value
 	    (tracer, MAP_TRACER_CTX_NAME, 0, (void *)&t_conf))
 		return -EINVAL;
+
+	ebpf_info("Config socket_data_limit_max: %d\n", socket_data_limit_max);
+	ebpf_info("Config io_event_collect_mode: %d\n", io_event_collect_mode);
+	ebpf_info("Config io_event_minimal_duration: %llu ns\n", io_event_minimal_duration);
+	ebpf_info("Config virtual_file_collect_enable: %d\n", virtual_file_collect_enable);
+	ebpf_info("Config g_disable_syscall_tracing: %d\n", g_disable_syscall_tracing);
+	ebpf_info("Config go_tracing_timeout: %d\n", go_tracing_timeout);
 
 	tracer->data_limit_max = socket_data_limit_max;
 
@@ -3617,7 +3723,7 @@ static int __unused get_fd_path(pid_t pid, u32 fd, char *buf, size_t bufsize)
 
 #define DATADUMP_FORMAT							\
 	"%s [datadump] SEQ %" PRIu64 " <%s> DIR %s TYPE %s(%d) PID %u "	\
-	"THREAD_ID %u COROUTINE_ID %" PRIu64 " ROLE %s"			\
+	"THREAD_ID %u COROUTINE_ID %" PRIu64 " FD %d ROLE %s"		\
 	" CONTAINER_ID %s SOURCE %d COMM %s "				\
 	"%s LEN %d SYSCALL_LEN %" PRIu64 " SOCKET_ID %" PRIu64		\
 	" " "TRACE_ID %" PRIu64 " TCP_SEQ %" PRIu64			\
@@ -3675,7 +3781,7 @@ static void print_socket_data(struct socket_bpf_data *sd, int64_t boot_time)
 		     sd->source == DATA_SOURCE_DPDK ? "Pkt" : proto_tag,
 		     sd->direction == T_EGRESS ? "out" : "in", type,
 		     sd->msg_type, sd->process_id, sd->thread_id,
-		     sd->coroutine_id, role_str,
+		     sd->coroutine_id, sd->fd, role_str,
 		     strlen((char *)sd->container_id) ==
 		     0 ? "null" : (char *)sd->container_id, sd->source,
 		     sd->process_kname, flow_str, sd->cap_len,

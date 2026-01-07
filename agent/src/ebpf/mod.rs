@@ -67,13 +67,13 @@ pub const SOCK_DATA_TARS: u16 = 46;
 #[allow(dead_code)]
 pub const SOCK_DATA_SOME_IP: u16 = 47;
 #[allow(dead_code)]
+pub const SOCK_DATA_ISO8583: u16 = 48;
+#[allow(dead_code)]
 pub const SOCK_DATA_MYSQL: u16 = 60;
 #[allow(dead_code)]
 pub const SOCK_DATA_POSTGRESQL: u16 = 61;
 #[allow(dead_code)]
 pub const SOCK_DATA_ORACLE: u16 = 62;
-#[allow(dead_code)]
-pub const SOCK_DATA_ISO8583: u16 = 70;
 #[allow(dead_code)]
 pub const SOCK_DATA_REDIS: u16 = 80;
 #[allow(dead_code)]
@@ -122,6 +122,12 @@ pub const FEATURE_PROFILE_MEMORY: c_int = 6;
 pub const FEATURE_SOCKET_TRACER: c_int = 7;
 #[allow(dead_code)]
 pub const FEATURE_DWARF_UNWINDING: c_int = 8;
+#[allow(dead_code)]
+pub const FEATURE_PROFILE_PYTHON: c_int = 9;
+#[allow(dead_code)]
+pub const FEATURE_PROFILE_PHP: c_int = 10;
+#[allow(dead_code)]
+pub const FEATURE_PROFILE_V8: c_int = 11;
 
 //追踪器当前状态
 #[allow(dead_code)]
@@ -152,8 +158,6 @@ pub const DATA_SOURCE_OPENSSL_UPROBE: u8 = 3;
 pub const DATA_SOURCE_IO_EVENT: u8 = 4;
 #[allow(dead_code)]
 pub const DATA_SOURCE_GO_HTTP2_DATAFRAME_UPROBE: u8 = 5;
-#[allow(dead_code)]
-pub const DATA_SOURCE_CLOSE: u8 = 6;
 #[allow(dead_code)]
 pub const DATA_SOURCE_UNIX_SOCKET: u8 = 8;
 cfg_if::cfg_if! {
@@ -190,6 +194,18 @@ pub const MSG_REASM_SEG: u8 = 6;
 // set to 'MSG_COMMON'.
 #[allow(dead_code)]
 pub const MSG_COMMON: u8 = 7;
+// Explanation of the case where the same socket has two sources:
+// Typical example:
+// TLS handshake and uprobe TLS encrypted data essentially share the same socket.
+// Initially, the handshake is traced via kprobe.
+// After a successful handshake, encrypted data is traced via uprobe.
+// Finally, a close event occurs.
+//
+// There is only one close event because there is only one socket communication.
+// The system sends only one close syscall, and at that time,
+// the close event's SOURCE is identified as uprobe.
+#[allow(dead_code)]
+pub const MSG_CLOSE: u8 = 10;
 
 //Register event types
 #[allow(dead_code)]
@@ -304,6 +320,7 @@ pub struct SK_BPF_DATA {
     pub cap_len: u32,          // 返回的cap_data长度
     pub cap_seq: u64, // cap_data在Socket中的相对顺序号，在所在socket下从0开始自增，用于数据乱序排序
     pub socket_role: u8, // this message is created by: 0:unkonwn 1:client(connect) 2:server(accept)
+    pub fd: u32,      // File descriptor for an open file or socket.
     pub cap_data: *mut c_char, // 内核送到用户空间的数据地址
 }
 
@@ -585,15 +602,15 @@ extern "C" {
     //            false Define a map without preallocated memory
     pub fn set_bpf_map_prealloc(enabled: bool) -> c_void;
 
-    // 参数说明：
-    // callback: 回调接口 rust -> C，返回值参考 TRACER_CALLBACK_FLAG_* 的定义
-    // thread_nr: 工作线程数，是指用户态有多少线程参与数据处理。
-    // perf_pages_cnt: 和内核共享内存占用的页框数量, 值为2的次幂。
-    // ring_size: 环形缓存队列大小，值为2的次幂。
-    // max_socket_entries: 设置用于socket追踪的hash表项最大值，取决于实际场景中并发请求数量。
-    // max_trace_entries: 设置用于线程/协程追踪会话的hash表项最大值。
-    // socket_map_max_reclaim: socket map表项进行清理的最大阈值，当前map的表项数量超过这个值进行map清理操作。
-    // 返回值：成功返回0，否则返回非0
+    // Parameter descriptions:
+    // callback: Callback interface from Rust to C; return values refer to definitions of TRACER_CALLBACK_FLAG_*.
+    // thread_nr: Number of worker threads, indicating how many user-space threads participate in data processing.
+    // perf_pages_cnt: Number of page frames occupied by shared memory with the kernel; value is a power of 2, with page frame size of 4 KB.
+    // ring_size: Size of the ring buffer queue; value is a power of 2.
+    // max_socket_entries: Maximum number of hash table entries for socket tracking, depending on the concurrency in the actual scenario.
+    // max_trace_entries: Maximum number of hash table entries for thread/coroutine tracking sessions.
+    // socket_map_max_reclaim: Maximum threshold for cleaning entries in the socket map; when the current number of entries exceeds this value, the map cleanup is triggered.
+    // Return value: Returns 0 on success, non-zero otherwise.
     pub fn running_socket_tracer(
         callback: extern "C" fn(_: *mut c_void, queue_id: c_int, sd: *mut SK_BPF_DATA) -> c_int,
         thread_nr: c_int,
@@ -765,7 +782,7 @@ extern "C" {
     pub fn enable_unix_socket_feature();
     pub fn disable_fentry();
     pub fn enable_fentry();
-
+    pub fn set_virtual_file_collect(enabled: bool) -> c_int;
     cfg_if::cfg_if! {
         if #[cfg(feature = "extended_observability")] {
             pub fn enable_offcpu_profiler() -> c_int;

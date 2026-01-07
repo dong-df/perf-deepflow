@@ -70,6 +70,27 @@ static const char *k_sym_prefix = "[k] ";
 static const char *lib_sym_prefix = "[l] ";
 static const char *u_sym_prefix = "";
 
+extern char *lua_format_folded_stack_trace(void *tracer_handle, uint32_t pid,
+					   const __u64 *frames, __u32 frame_count,
+					   bool new_cache, void *info_p,
+					   const char *err_tag);
+
+// Stack trace structure definition (user-space copy of eBPF structure)
+// Must match the definition in perf_profiler.bpf.c
+#ifndef PERF_MAX_STACK_DEPTH
+#define PERF_MAX_STACK_DEPTH 127
+#endif
+
+typedef struct {
+	u8 len;                                    // Number of frames in the stack
+	u64 addrs[PERF_MAX_STACK_DEPTH];          // Frame addresses (or pointer_and_type for V8)
+	u8 frame_types[PERF_MAX_STACK_DEPTH];     // Frame type markers (FRAME_TYPE_*)
+	// Extra data for interpreter frames (2 u64s per frame)
+	// For V8: extra_data_a[i] = delta_or_marker, extra_data_b[i] = return_address
+	u64 extra_data_a[PERF_MAX_STACK_DEPTH];
+	u64 extra_data_b[PERF_MAX_STACK_DEPTH];
+} stack_t;
+
 /*
  * To track the scenario where stack data is missing in the eBPF
  * 'stack_map_*' table. This typically occurs due to the design of
@@ -378,21 +399,29 @@ static inline int symcache_resolve(pid_t pid, void *resolver, u64 address,
 	return ret;
 }
 
-static char *resolve_addr(struct bpf_tracer *t, pid_t pid, bool is_start_idx,
+/*
+ * Shared native resolver for both the C stringifier and the Rust Lua decoder.
+ * Lua’s logical stack may include TAG_CFUNC frames (Lua→C calls). Rust calls 
+ * this helper to resolve those native PCs using the same symbol cache.
+ * the void *tracer_handle should be struct bpf_tracer *
+ */
+char *resolve_addr(void *tracer_handle, uint32_t pid, bool is_start_idx,
 			  u64 address, bool is_create, void *info_p)
 {
-	ASSERT(pid >= 0);
+	pid_t pid_signed = (pid_t)pid;
+
+	ASSERT(pid_signed >= 0);
 
 	int len = 0;
 	char *ptr = NULL;
 	char format_str[32];
 	struct bcc_symbol sym;
 	memset(&sym, 0, sizeof(sym));
-	void *resolver = get_symbol_cache(pid, is_create);
+	void *resolver = get_symbol_cache(pid_signed, is_create);
 	if (resolver == NULL)
 		goto resolver_err;
 
-	int ret = symcache_resolve(pid, resolver, address, &sym, info_p, &ptr);
+	int ret = symcache_resolve(pid_signed, resolver, address, &sym, info_p, &ptr);
 	if (ret == 0 && ptr) {
 		char *p = ptr;
 		/*
@@ -471,13 +500,42 @@ finish:
 
 static int get_stack_ips(struct bpf_tracer *t,
 			 const char *stack_map_name, int stack_id, u64 * ips,
-			 u64 ts)
+			 stack_t *full_stack, u64 ts)
 {
 	ASSERT(stack_id >= 0);
+
+	// Determine if this is a custom stack map (with frame_types and extra_data)
+	// or a regular stack map (only addresses)
+	bool is_custom_map = (strstr(stack_map_name, "custom") != NULL);
+
+	// Try to read full stack_t structure first (for interpreter stacks with V8/Python/PHP)
+	// Only attempt this if the map name indicates it's a custom map
+	if (full_stack && is_custom_map &&
+	    bpf_table_get_value(t, stack_map_name, stack_id, (void *)full_stack)) {
+		// Successfully read full stack_t structure, copy addrs to ips for compatibility
+		memcpy(ips, full_stack->addrs, sizeof(full_stack->addrs));
+
+		// Debug: Check if data is valid
+		int non_zero_count = 0;
+		for (int i = 0; i < PERF_MAX_STACK_DEPTH; i++) {
+			if (full_stack->addrs[i] != 0) non_zero_count++;
+		}
+		return ETR_OK;
+	}
+
+	// Fallback: read only addresses (for regular stack traces)
+	// CRITICAL FIX: Clear full_stack BEFORE reading data to avoid zeroing out the data
+	// we just read. When called with ips=stack.addrs and full_stack=&stack, the memset
+	// after bpf_table_get_value would zero out the stack addresses we just read.
+	if (full_stack) {
+		memset(full_stack, 0, sizeof(*full_stack));
+	}
 
 	if (!bpf_table_get_value(t, stack_map_name, stack_id, (void *)ips)) {
 		return ETR_NOTEXIST;
 	}
+
+	// Note: No need to memcpy ips to full_stack->addrs because they point to the same memory
 
 	return ETR_OK;
 }
@@ -502,8 +560,9 @@ static char *build_stack_trace_string(struct bpf_tracer *t,
 	u64 sentinel_addr = 0xcccccccccccccccc;
 	int i;
 
-	u64 ips[PERF_MAX_STACK_DEPTH];
-	memset(ips, 0, sizeof(ips));
+	// Use full stack_t structure to access frame_types and extra_data
+	stack_t stack;
+	memset(&stack, 0, sizeof(stack));
 
 	symbol_t symbols[MAX_SYMBOL_NUM];
 	memset(symbols, 0, sizeof(symbols));
@@ -518,21 +577,26 @@ static char *build_stack_trace_string(struct bpf_tracer *t,
 			return NULL;
 		}
 		symbol_t key = {};
-		while (bpf_get_next_key(map->fd, &key, &symbols[n_symbols]) == 0) {
-			int ret = bpf_lookup_elem(map->fd, &key, &symbol_ids[n_symbols]);
-			key = symbols[n_symbols];
+		symbol_t next_key = {};
+		while (bpf_get_next_key(map->fd, &key, &next_key) == 0 && n_symbols < MAX_SYMBOL_NUM) {
+			int ret = bpf_lookup_elem(map->fd, &next_key, &symbol_ids[n_symbols]);
 			if (ret == 0) {
+				symbols[n_symbols] = next_key;
 				n_symbols++;
 			}
+			key = next_key;
 		}
 	}
 
 	int ret;
-	if ((ret = get_stack_ips(t, stack_map_name, stack_id, ips, ts))) {
+	if ((ret = get_stack_ips(t, stack_map_name, stack_id, stack.addrs, &stack, ts))) {
 		stack_table_data_miss++;
 		*ret_val = ret;
 		return NULL;
 	}
+
+	// For debugging: stack.len is the number of frames
+	u64 *ips = stack.addrs;
 
 	char *str = NULL;
 	ret = VEC_OK;
@@ -549,7 +613,56 @@ static char *build_stack_trace_string(struct bpf_tracer *t,
 		if (start_idx == -1)
 			start_idx = i;
 
-		if (use_symbol_table) {
+		// Check if this is a V8 frame using frame_types array
+		if (stack.frame_types[i] == FRAME_TYPE_V8) {
+			// Extract V8 frame information
+			// ips[i] = packed pointer and frame type (lower 3 bits = type, rest = pointer)
+			// extra_data_a[i] = bytecode offset, source position, or frame marker
+			// extra_data_b[i] = SharedFunctionInfo pointer for fallback
+			u64 pointer_and_type = ips[i];
+			u64 delta_or_marker = stack.extra_data_a[i];
+			u64 sfi_fallback = stack.extra_data_b[i];
+			// Call Rust V8 symbolizer with SFI fallback
+			str = resolve_v8_frame((u32)pid, pointer_and_type, delta_or_marker, sfi_fallback);
+			if (str == NULL) {
+				// Fallback if symbolization failed
+				char v8_symbol[256];
+				u8 frame_type = pointer_and_type & V8_FILE_TYPE_MASK;
+				snprintf(v8_symbol, sizeof(v8_symbol), "V8:type%d@%llx+%llx",
+				        frame_type, (unsigned long long)(pointer_and_type & ~V8_FILE_TYPE_MASK),
+				        (unsigned long long)delta_or_marker);
+				int len = strlen(v8_symbol);
+				str = clib_mem_alloc_aligned("v8_symbol", len + 1, 0, NULL);
+				if (str) {
+					strcpy(str, v8_symbol);
+				}
+			}
+		// Check if this is a PHP frame
+		} else if (stack.frame_types[i] == FRAME_TYPE_PHP) {
+			// Extract PHP frame information
+			// ips[i] = zend_function pointer
+			// extra_data_a[i] = packed (type_info << 32) | lineno for top-level code detection
+			// extra_data_b[i] = JIT flag (1 for JIT, 0 for interpreted)
+			u64 zend_function_ptr = ips[i];
+			u64 lineno_and_type = stack.extra_data_a[i];
+			u64 is_jit = stack.extra_data_b[i];
+			// Call Rust PHP symbolizer (now returns clib_mem allocated string like V8)
+			str = resolve_php_frame((u32)pid, zend_function_ptr, lineno_and_type, is_jit);
+			if (str == NULL) {
+				// Fallback if symbolization failed
+				char php_symbol[256];
+				u32 type_info = (u32)(lineno_and_type >> 32);
+				u32 lineno = (u32)(lineno_and_type & 0xFFFFFFFF);
+				snprintf(php_symbol, sizeof(php_symbol), "PHP:type%u@%llx:%llu",
+				        type_info, (unsigned long long)zend_function_ptr, (unsigned long long)lineno);
+				int len = strlen(php_symbol);
+				str = clib_mem_alloc_aligned("php_symbol", len + 1, 0, NULL);
+				if (str) {
+					strcpy(str, php_symbol);
+				}
+			}
+		// Normal frame
+		} else if (use_symbol_table) {
 			str = resolve_custom_symbol_addr(symbols, symbol_ids, n_symbols, (i == start_idx), ips[i]);
 		} else {
 			str = resolve_addr(t, pid, (i == start_idx), ips[i], new_cache, info_p);
@@ -603,6 +716,67 @@ failed:
 	return NULL;
 }
 
+static char *folded_lua_stack_trace_string(struct bpf_tracer *t,
+					   int stack_id,
+					   pid_t pid,
+					   const char *stack_map_name,
+					   stack_str_hash_t * h,
+					   bool new_cache, void *info_p)
+{
+	/* Interpreter stacks are optional; missing ids indicate the kernel skipped unwinding. */
+	if (stack_id < 0) {
+		return NULL;
+	}
+
+	stack_str_hash_kv kv;
+	kv.key = ((u64) pid << 32) | (u32) stack_id;
+	kv.value = 0;
+	if (stack_str_hash_search(h, &kv, &kv) == 0) {
+		__sync_fetch_and_add(&h->hit_hash_count, 1);
+		return (char *)kv.value;
+	}
+
+	if (!stack_map_name) {
+		return NULL;
+	}
+	/* Raw frames come from the interpreter stack map populated by the Lua BPF program. */
+	int fd = bpf_table_get_fd(t, stack_map_name);
+	if (fd < 0) {
+		return NULL;
+	}
+
+	__u64 raw_frames[PERF_MAX_STACK_DEPTH] = { 0 };
+	__u32 key = stack_id;
+	if (bpf_lookup_elem(fd, &key, &raw_frames) != 0) {
+		return NULL;
+	}
+
+	u32 frame_count = 0;
+	for (; frame_count < PERF_MAX_STACK_DEPTH; frame_count++) {
+		if (raw_frames[frame_count] == 0) {
+			break;
+		}
+	}
+	if (frame_count == 0) {
+		return NULL;
+	}
+
+	char *result =
+	    lua_format_folded_stack_trace(t, pid, raw_frames, frame_count,
+					  new_cache, info_p, i_err_tag);
+	if (!result) {
+		return NULL;
+	}
+
+	kv.value = pointer_to_uword(result);
+	if (stack_str_hash_add_del(h, &kv, 1)) {
+		clib_mem_free(result);
+		result = NULL;
+	}
+
+	return result;
+}
+
 static char *folded_stack_trace_string(struct bpf_tracer *t,
 				       int stack_id,
 				       pid_t pid,
@@ -613,9 +787,15 @@ static char *folded_stack_trace_string(struct bpf_tracer *t,
 {
 	ASSERT(pid >= 0 && stack_id >= 0);
 
+	if (use_symbol_table && is_lua_process((uint32_t)pid)) {
+		return folded_lua_stack_trace_string(t, stack_id, pid,
+						      stack_map_name, h,
+						      new_cache, info_p);
+	}
+
 	/*
 	 * Firstly, search the stack-trace hash to see if the
-	 * stack trace string has already been stored. 
+	 * stack trace string has already been stored.
 	 */
 	stack_str_hash_kv kv;
 	kv.key = (u64) stack_id;
@@ -769,10 +949,21 @@ char *resolve_and_gen_stack_trace_str(struct bpf_tracer *t,
 	}
 
 	bool has_intpstack = v->intpstack > 0;
+	bool is_lua = false;
+
 	if (has_intpstack) {
-		i_trace_str = folded_stack_trace_string(t, v->intpstack, v->tgid, custom_stack_map_name, h, new_cache, info_p, v->timestamp, ignore_libs, true);
+		i_trace_str = folded_stack_trace_string(t, v->intpstack, v->tgid,
+							custom_stack_map_name, h,
+							new_cache, info_p,
+							v->timestamp,
+							ignore_libs, true);
 		if (i_trace_str != NULL) {
-			len += strlen(i_trace_str) + strlen(INCOMPLETE_PYTHON_STACK) + 2;
+			is_lua = is_lua_process((uint32_t)v->tgid);
+			if (is_lua) {
+				len += strlen(i_trace_str) + 1;
+			} else {
+				len += strlen(i_trace_str) + strlen(INCOMPLETE_PYTHON_STACK) + 2;
+			}
 		} else {
 			len += strlen(i_err_tag);
 		}
@@ -784,10 +975,19 @@ char *resolve_and_gen_stack_trace_str(struct bpf_tracer *t,
 		goto error;
 	}
 
-	/* trace_str = i_stack_str_fn() + ";" + u_stack_str_fn() + ";" + k_stack_str_fn(); */
+	/* trace_str combines user/interpreter/kstack strings in call-order (root -> leaf). */
 	int offset = 0;
 	if (i_trace_str && u_trace_str) {
-		offset += merge_python_stacks(trace_str + offset, len - offset, i_trace_str, u_trace_str);
+		if (is_lua) {
+			offset += merge_lua_stacks(trace_str + offset, len - offset,
+						   u_trace_str, i_trace_str);
+		} else if (is_php_process(v->tgid)) {
+			offset += merge_php_stacks(trace_str + offset, len - offset, i_trace_str, u_trace_str);
+		} else if (is_v8_process(v->tgid)) {
+			offset += merge_v8_stacks(trace_str + offset, len - offset, i_trace_str, u_trace_str);
+		} else {
+			offset += merge_python_stacks(trace_str + offset, len - offset, i_trace_str, u_trace_str);
+		}
 	} else if (i_trace_str) {
 		offset += snprintf(trace_str + offset, len - offset, "%s", i_trace_str);
 	} else if (u_trace_str) {
@@ -805,7 +1005,7 @@ char *resolve_and_gen_stack_trace_str(struct bpf_tracer *t,
 	}
 
 	if (offset == 0) {
-		/* 
+		/*
 		 * The kernel can indicate the invalidity of a stack ID in two
 		 * different ways:
 		 *

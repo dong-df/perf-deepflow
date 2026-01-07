@@ -39,7 +39,7 @@ deepflow-agent 使用 cgroups 来限制自身的 CPU 用量，
 
 **标签**:
 
-`hot_update`
+<mark>agent_restart</mark>
 
 **FQCN**:
 
@@ -63,7 +63,12 @@ global:
 
 **详细描述**:
 
-deepflow-agent 使用 cgroups 限制自身的 memory 用量.
+deepflow-agent 使用 cgroups 限制自身的 memory 用量。
+
+注意：
+- 专属采集器内存不受限制
+- 容器采集器内存限制由容器管理工具来实现
+- 同集群的容器采集器内存限制需要一致
 
 ### 日志每小时回传上限 {#global.limits.max_log_backhaul_rate}
 
@@ -889,6 +894,8 @@ global:
 **详细描述**:
 
 deepflow-agent 是否向 deepflow-server 做 NTP 同步的开关。
+
+注意：开启 NTP 前控制器需要先开启 NTP 服务，直到完成同步时间后采集器才会继续运行。
 
 ### 最大时钟偏差 {#global.ntp.max_drift}
 
@@ -1874,6 +1881,27 @@ inputs:
     - enabled_features:
       - ebpf.profile.on_cpu
       - proc.gprocess_info
+      match_regex: \b(?:lua|luajit)(\S)*( +-\S+)* +(\S*/)*([^ /]+)
+      match_type: cmdline_with_args
+      only_in_container: false
+      rewrite_name: $5
+    - enabled_features:
+      - ebpf.profile.on_cpu
+      - proc.gprocess_info
+      match_regex: \bphp(\d+)?(-fpm|-cli|-cgi)?( +-\S+)* +(\S*/)*([^ /]+\.php)
+      match_type: cmdline_with_args
+      only_in_container: false
+      rewrite_name: $5
+    - enabled_features:
+      - ebpf.profile.on_cpu
+      - proc.gprocess_info
+      match_regex: \b(node|nodejs)( +--\S+)* +(\S*/)*([^ /]+\.js)
+      match_type: cmdline_with_args
+      only_in_container: false
+      rewrite_name: $4
+    - enabled_features:
+      - ebpf.profile.on_cpu
+      - proc.gprocess_info
       match_regex: ^deepflow-
       only_in_container: false
     - enabled_features:
@@ -2030,6 +2058,8 @@ inputs:
 | java | |
 | golang | |
 | python | |
+| lua | |
+| php | |
 | nodejs | |
 | dotnet | |
 
@@ -3711,7 +3741,7 @@ inputs:
 - 如果上面没有搜到 "libssl.so" 也可能是静态编译了，这时候我们可以通过下面方式确认：
   执行命令 `sudo nm /proc/<PID>/exe | grep SSL_write` 若包含 `SSL_write` 相关信息如：`0000000000502ac0 T SSL_write`
   则说明该进程正在使用静态编译的 openssl 库。
-  
+
 启用后，deepflow-agent 将获取符合正则表达式匹配的进程信息，并 Hook openssl 库的相应加解密接口。
 在日志中您会看到类似如下信息：
 ```
@@ -4407,6 +4437,36 @@ inputs:
 deepflow-agent 所采集的文件 IO 事件的时延下限阈值，操作系统中时延低于此阈值
 的文件 IO 事件将被忽略。
 
+##### 启用虚拟文件采集 {#inputs.ebpf.file.io_event.enable_virtual_file_collect}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.file.io_event.enable_virtual_file_collect`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    file:
+      io_event:
+        enable_virtual_file_collect: false
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+当设置为 true 时，deepflow-agent 将采集发生在虚拟文件系统上的文件
+I/O 事件（例如 /proc、/sys、/run 等由内核动态生成的伪文件系统）。
+当设置为 false 时，将不会采集虚拟文件系统上的文件 I/O 事件。
+
 ### Profile {#inputs.ebpf.profile}
 
 #### 栈回溯 {#inputs.ebpf.profile.unwinding}
@@ -4973,6 +5033,98 @@ inputs:
 ingester 的 CPU 开销，但是 Agent 也会因此消耗更多的 CPU。测试表明，将deepflow-agent 自身的
 on-cpu 函数调用栈压缩，可以将带宽消耗降低 `x` 倍，但会使得 agent 额外消耗 `y%` 的 CPU。
 
+#### 语言特定剖析 {#inputs.ebpf.profile.languages}
+
+控制对哪些解释型语言进行剖析。禁用不使用的语言可以节省每个语言约 5-6 MB 内存。
+总内存占用：~17-20 MB（全部启用），~6.1 MB（仅 Python），~5.2 MB（仅 PHP），~6.4 MB（仅 Node.js）。
+
+##### 禁用 Python 剖析 {#inputs.ebpf.profile.languages.python_disabled}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.languages.python_disabled`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      languages:
+        python_disabled: false
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+禁用 Python 解释器剖析。禁用后将不采集 Python 进程的函数调用栈，
+可节省约 6.1 MB 内核内存（python_tstate_addr_map、python_unwind_info_map、python_offsets_map）。
+
+##### 禁用 PHP 剖析 {#inputs.ebpf.profile.languages.php_disabled}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.languages.php_disabled`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      languages:
+        php_disabled: false
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+禁用 PHP 解释器剖析。禁用后将不采集 PHP 进程的函数调用栈，
+可节省约 5.2 MB 内核内存（php_unwind_info_map、php_offsets_map）。
+
+##### 禁用 Node.js 剖析 {#inputs.ebpf.profile.languages.nodejs_disabled}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.languages.nodejs_disabled`
+
+**默认值**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      languages:
+        nodejs_disabled: false
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**详细描述**:
+
+禁用 Node.js（V8）解释器剖析。禁用后将不采集 Node.js 进程的函数调用栈，
+可节省约 6.4 MB 内核内存（v8_unwind_info_map）。
+
 ### 调优 {#inputs.ebpf.tunning}
 
 #### 采集队列大小 {#inputs.ebpf.tunning.collector_queue_size}
@@ -5068,6 +5220,7 @@ inputs:
 
 内核共享内存占用的页数。值为 `2^n (5 <= n <= 13)`。用于 perf 数据传输。
 如果值在 `2^n` 和 `2^(n+1)` 之间，将自动调整到最小值 `2^n`。
+页的大小为4KB。
 
 #### 内核环形队列大小 {#inputs.ebpf.tunning.kernel_ring_size}
 
@@ -6310,7 +6463,10 @@ transforms:
     - host_metrics
     source: |
       .tags.instance = "${K8S_NODE_IP_FOR_DEEPFLOW}"
-      .tags.host = "${K8S_NODE_NAME_FOR_DEEPFLOW}"
+      host_name, _ = get_env_var("K8S_NODE_NAME_FOR_DEEPFLOW")
+      if !is_empty(host_name) {
+        .tags.host = host_name
+      }
       metrics_map = {
         "boot_time": "boot_time_seconds",
         "memory_active_bytes": "memory_Active_bytes",
@@ -6394,7 +6550,7 @@ transforms:
     type: filter
     inputs:
     - cadvisor_metrics
-    condition: "!match(string!(.name), r'container_cpu_(cfs_throttled_seconds_total|load_average_10s|system_seconds_total|user_seconds_total)|container_fs_(io_current|io_time_seconds_total|io_time_weighted_seconds_total|reads_merged_total|sector_reads_total|sector_writes_total|writes_merged_total)|container_memory_(mapped_file|swap)|container_(file_descriptors|tasks_state|threads_max)|container_spec.*')"
+    condition: "!match(string!(.name), r'container_cpu_(cfs_throttled_seconds_total|load_average_10s|system_seconds_total|user_seconds_total)|container_fs_(io_current|io_time_seconds_total|io_time_weighted_seconds_total|reads_merged_total|sector_reads_total|sector_writes_total|writes_merged_total)|container_memory_(mapped_file|swap)|container_(file_descriptors|tasks_state|threads_max)')"
   kubelet_relabel_filter:
     type: filter
     inputs:
@@ -7124,6 +7280,98 @@ deepflow-agent 会周期性标记每一个<vpc, ip, protocol, port>四元组承�
 后续数据的应用协议采集过程。为避免误判，应用协议类型的标记结果会周期性更新。该参数控制应用协议的更
 新周期。
 
+#### 推理白名单 {#processors.request_log.application_protocol_inference.inference_whitelist}
+
+**标签**:
+
+`hot_update`
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.inference_whitelist`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      inference_whitelist:
+      - port_list:
+        - 15001
+        - 15006
+        process_name: envoy
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | dict |
+
+**详细描述**:
+
+应用协议端口白名单列表，目前仅支持 eBPF 流量。当 eBPF 数据在白名单列表中时，不会再使用应用表查询应用协议，
+对应的应用协议通过轮训目前所有支持的协议来获取，白名单数据过多会降低 eBPF 数据的处理性能。
+
+配置键：
+- process_name: 进程名称，不支持正则表达式
+- port_list: 端口白名单列表
+
+##### 进程名称 {#processors.request_log.application_protocol_inference.inference_whitelist.process_name}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.inference_whitelist.process_name`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      inference_whitelist:
+      - process_name: ''
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**详细描述**:
+
+进程名称
+
+##### 端口列表 {#processors.request_log.application_protocol_inference.inference_whitelist.port_list}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.inference_whitelist.port_list`
+
+**默认值**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      inference_whitelist:
+      - port_list: []
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+
+**详细描述**:
+
+端口列表
+
 #### 启用协议列表 {#processors.request_log.application_protocol_inference.enabled_protocols}
 
 **标签**:
@@ -7531,7 +7779,7 @@ processors:
 自定义协议解析配置，支持通过简单的规则识别用户自定义的 L7 协议。
 示例：
 ```yaml
-- protorol_name: "your_protocol_name" # 协议名称，对应 l7_flow_log.l7_protocol_str，注意：必须存在一个 `processors.request_log.tag_extraction.custom_field_policies` 配置，否则无法上报识别结果
+- protocol_name: "your_protocol_name" # 协议名称，对应 l7_flow_log.l7_protocol_str，注意：必须存在一个 `processors.request_log.tag_extraction.custom_field_policies` 配置，否则无法上报识别结果
   pre_filter:
     port_list: 1-65535 # 预过滤端口，可以提高解析性能
   request_characters:  # 多个特征之间是 OR 的关系
@@ -8560,7 +8808,7 @@ processors:
 
 **标签**:
 
-<mark>agent_restart</mark>
+`hot_update`
 <mark>ee_feature</mark>
 
 **FQCN**:
@@ -8583,39 +8831,238 @@ processors:
 **详细描述**:
 
 自定义字段提取策略，用于通过简单的规则提取 L7 协议中可能存在的自定义字段
+同时匹配插件和自定义提取策略时，优先级为：
+1. 插件提取
+2. 自定义字段提取
+3. 采集器默认提取
 示例：
 ```yaml
 - policy_name: "my_policy" # 策略名称
   protocol_name: HTTP # 协议名称，如要解析 Grpc 请配置为 HTTP2，可选值： HTTP/HTTP2/Dubbo/SofaRPC/Custom/...
   custom_protocol_name: "my_protocol"  # 当 protocol_name 为 Custom 时生效，注意：此时必须存在一个 `processors.request_log.application_protocol_inference.custom_protocols` 配置，且自定义名称协议名称相等，否则无法解析
-  port_list: 1-65535
+  filters:
+    traffic_direction: both # 在请求、响应或二者中搜索，默认值为 both，可选值 request/response/both
+    port_list: 1-65535 # 可以用于过滤端口
+    feature_string: "" # 可以用于提取前匹配 Payload，对 header_field 类型无效
+  # 是否保存原始数据。
+  # 注意该配置仅在满足 filters 的条件下生效。
+  raw:
+    save_request:
+      enabled: false
+      output:
+        attribute_name: request
+    save_response:
+      enabled: false
+      output:
+        attribute_name: response
   fields:
-  - field_name: "my_field" # 配置的字段
-    field_match_type: "string" # 可选值："string"
-    field_match_ignore_case: "false" # 当匹配 field 时是否忽略大小写，默认值：false
-    field_match_keyword: "abc" # 可以填写额外的字符以提升匹配准确率，例如 `"\"abc\": \""`
-
-    subfield_match_keyword: "y" # 有些情况下，我们需要提取一个子字段，例如 HTTP 的 Cookie 字段中，我们仅仅只需要提取其中的一部分，例如，我们要从 `abc: x=1,y=2,z=3` 的 Value（`x=1,y=2,z=3`）中提取 y 对应的值
-    separator_between_subfield_kv_pair: "," # 用于分割 key-value 键值对的分隔符，默认值：空
-    separator_between_subfield_key_and_value: "=" # 用于分割 key 和 value 的分隔符，默认值：空
-
-    field_type: "http_url_field" # 字段的提取类型，可选值：http_url_field/header_field/payload_json_value/payload_xml_value/payload_hessian2_value，默认值为 `header_field`，含义见下方说明
-    traffic_direction: request # 可以限定仅在请求（或仅在响应）中搜索，默认值为 both，可选值：request/response/both
-    check_value_charset: false # 可用于检查提取结果是否合法
-    value_primary_charset: ["digits", "alphabets", "chinese"] # 提取结果校验字符集，可选值：digits/alphabets/chinese
-    value_special_charset: ".-_" # 提取结果校验字符集，额外校验这些特殊字符
-    attribute_name: "xyz" # 此时该字段将会出现在调用日志的 attribute.xyz 中，默认值为空，为空时该字段不会加入到 attribute 内
-    rewrite_native_tag: version # rewrite 可以填写以下几种字段之一，用于覆写对应字段的值：version/request_type/request_domain/request_resource/request_id/endpoint/response_code/response_exception/response_result/trace_id/span_id/x_request_id/http_proxy_client
-    rewrite_response_status: # rewrite response_status 字段，当 response_code 在 success_values 数组中时，会将 response_status 设置为 success，否则设置为 server_error
-      success_values: []
-    metric_name: "xyz" # 此时该字段将会出现在调用日志的 metrics.xyz 中，默认值为空
+  - name: "my_field" # 字段名，用于 compound_fields 中
+    # 字段的提取类型，可选值及含义为：
+    # - `http_url_field`：从 HTTP URL 末尾的参数中提取字段，URL 末尾形如：`?key=value&key2=value2`
+    # - `header_field`：从 HTTP/Dubbo/SofaRPC/...等协议的 Header 部分提取字段，例如 HTTP 的 Header 形如：`key: value`
+    # - `payload_json_value`：从 Json Payload 中提取字段，形如：`"key": 1`,  或者 `"key": "value"`,  或者 `"key": None`, 等等 ...
+    # - `payload_xml_value`：从 XML Payload 中提取字段，形如：`<key attr="xxx">value</key>`
+    # - `payload_hessian2_value`：Payload 使用 Hessian2 编码，从中提取字段
+    # - `sql_insertion_column`：从 SQL 插入列中提取字段，例如：`INSERT INTO table (column1, column2) VALUES (value1, value2)`。目前只支持 MySQL 协议，且只能提取插入的第一列内容。
+    type: "http_url_field"
+    # 匹配规则
+    match:
+      # 匹配类型，可选值："string" 和 "path"
+      # 配置为 "string" 时
+      # - 对于 http_url_field 和 header_field 匹配 key，对于 sql_insertion_column 匹配 SQL 插入列名
+      # - 对于 payload_json_value 和 payload_xml_value 匹配 JSON 和 XML 格式的内容，并取第一个匹配位置后的元素作为结果
+      # "path" 类型只对 parse_json_value 和 parse_xml_value 类型的字段有效，可以用 "aaa.bbb.ccc" 这样的语法按层级提取 XML 和 JSON 格式的内容
+      type: "string"
+      keyword: "abc"
+      # 是否忽略大小写，默认值：false，仅当 `type` 为 "string" 时有效
+      ignore_case: false
+      # 是否对所有叶子节点应用字段规则，默认值：false
+      # 该配置只对 parse_json_value 和 parse_xml_value 类型的字段有效
+      # 设置为 true 时，字段规则将有以下行为改变：
+      # - 对 keyword 匹配 JSON 或 XML 的内容下所有叶子节点应用规则
+      # - output 中配置只有 attribute_name 生效，表示输出结果的前缀。输出的名字将使用 attribute_name 作为前缀，后接叶子节点的路径作为后缀，中间以 “.” 分隔
+      # - field 将无法用于 compound_fields 中
+      all_leaves: false
+    # 后处理，注意这里的配置是顺序执行的
+    # 配置格式为：
+    # - type: post_processing_type
+    #   setting:
+    #   - key: setting_key
+    #     value: setting_value
+    # 其中 type 支持的类型为：
+    # - remap
+    # - obfuscate
+    # - url_decode
+    # - base64_decode
+    # - parse_json_value
+    # - parse_xml_value
+    # - parse_key_value
+    # 各类型具体说明和配置方式见下
+    post:
+    # remap 用于将提取结果映射为另一个值
+    # 支持的配置：
+    # - dictionary_name: 字典名称
+    - type: remap
+      settings:
+      - key: dictionary_name
+        value: dict_1
+    # obfuscate 用于对提取结果进行脱敏处理
+    # 支持的配置：
+    # - mask: 脱敏用的字符，默认为 *，只支持 ascii 字符
+    # - preset: 使用预制的脱敏方式，合法的值有：
+    #   - id-card-name 身份证姓名脱敏（只显示名字中第一个字符）
+    #   - id-card-number 身份证号码脱敏（只显示前六位和后四位）
+    #   - phone-number 电话号码脱敏（隐藏中间不少于四位）
+    # - range: 表示从第几个字符到第几个字符替换为 *，即只保留第一个和最后一个字符
+    - type: obfuscate
+      settings:
+      - key: mask
+        value: *
+      - key: preset
+        value: id-card-name
+      - key: range
+        value: "1, -1" # 表示从第二个字符到倒数第一个字符替换为 *，即只保留第一字
+      - key: range # 配置多个代表多范围替换
+        value: "6, -5" # 表示第七个字符到倒数第五个字符替换为 *
+    # url_decode 用于对提取结果进行 URL 解码
+    - type: url_decode
+    # base64_decode 用于对提取结果进行 Base64 解码，输出的结果须为合法的 utf-8
+    - type: base64_decode
+    # parse_json_value 用于对提取结果进行 JSON 解析
+    # 支持的配置：
+    # - keyword: 关键词
+    # - type: 类型，可选值：string/path
+    # - ignore_case: 是否忽略大小写，默认值：false
+    # - skip: 表示跳过前几个匹配结果，从第几个开始取
+    - type: parse_json_value
+      settings:
+      - key: keyword
+        value: xyz
+      - key: type
+        value: string
+      - key: ignore_case
+        value: false
+      - key: skip
+        value: 0
+    # parse_xml_value 用于对提取结果进行 XML 解析
+    # 支持的配置：
+    # - keyword: 关键词
+    # - type: 类型，可选值：string/path
+    # - ignore_case: 是否忽略大小写，默认值：false
+    # - skip: 表示跳过前几个匹配结果，从第几个开始取
+    - type: parse_xml_value
+      # 这部分配置与 fields -> match 相同，只是拆成 key/value 的形式
+      # 额外支持 skip 配置，表示取第几个匹配结果
+      settings:
+      - key: keyword
+        value: xyz
+      - key: type
+        value: string
+      - key: ignore_case
+        value: false
+      - key: skip
+        value: 0
+    # parse_key_value 用于对提取结果按键值对解析
+    # 支持的配置：
+    # - key_value_pair_separator: 键值对分隔符，默认值：","
+    # - key_value_separator: 键值分隔符，默认值："="
+    # - keyword: 关键词
+    # - ignore_case: 是否忽略大小写，默认值：false
+    - type: parse_key_value
+      settings:
+      - key: key_value_pair_separator
+        value: ","
+      - key: key_value_separator
+        value: "="
+      - key: keyword
+        value: xyz
+      - key: ignore_case
+        value: true
+    # 验证 post 处理后的结果是否合法
+    verify:
+      check_charset: false # 可用于检查提取结果是否合法
+      primary_charset: ["digits", "alphabets", "hanzi"] # 提取结果校验字符集，可选值：digits/alphabets/hanzi
+      special_characters: ".-_" # 提取结果校验字符集，额外校验这些特殊字符
+    output:
+      attribute_name: "xyz" # 此时该字段将会出现在调用日志的 attribute.xyz 中，默认值为空，为空时该字段不会加入到 attribute 内
+      metric_name: "xyz" # 此时该字段将会出现在调用日志的 metrics.xyz 中，默认值为空
+      rewrite_native_tag:
+        # 可以填写以下几种字段之一，用于覆写对应字段的值
+        # 注意对应的协议需要支持，否则配置无效
+        # 当重写 response_code 时，自动将原来的非空值以 `sys_response_code` 为名写入 attribute 中
+        # - version
+        # - request_type
+        # - request_domain
+        # - request_resource
+        # - request_id
+        # - endpoint
+        # - response_code
+        # - response_exception
+        # - response_result
+        # - trace_id
+        # - span_id
+        # - x_request_id
+        # - x_request_id_0
+        # - x_request_id_1
+        # - http_proxy_client
+        # - biz_type
+        # - biz_code
+        # - biz_scenario
+        name: version
+        # 映射字典名称，配置不为空时将输入用所配置的字典进行映射。配置为空时不生效
+        # 注意：condition 中的黑白名单匹配映射后的结果
+        remap: dict_1
+        condition:
+          enum_whitelist: [] # 枚举白名单，当提取结果在白名单中时，进行重写。配置为空时不生效
+          enum_blacklist: [] # 枚举黑名单，当提取结果在黑名单中时，不进行重写
+      # 根据提取值匹配下列数组内容，如果匹配到，则将 response_status 设置为对应的值
+      rewrite_response_status:
+        ok_values: []
+        client_error_values: []
+        server_error_values: []
+        default_status: "" # 可选为 ok/client_error/server_error，设置为空时如果没有匹配则不进行重写。默认值为空
+      # 字段输出优先级，默认值为 0，范围 0-255，值越小优先级越高
+      # 对于只保留一个值的字段而言（除 trace_id 外），相同的字段只保留值最小的一个
+      # 对于多个值的字段（trace_id）而言，按优先级从高到低的顺序进行输出
+      priority: 0
+  # 直接用常量值作为字段值
+  const_fields:
+  - value: "123"
+    # 输出配置，参考 fields 中 output 的说明进行配置，但不支持 metric，rewrite_response_status 和 rewrite_native_tag 中的 remap/condition
+    output:
+      attribute_name: "xyz"
+      rewrite_native_tag:
+        name: version
+      priority: 0
+  # 复合字段，可以使用配置的 field 或 native_tag 作为输入字段，进行格式化输出
+  # 如果未解析到对应的 field 或 native_tag 为空，则不进行输出
+  compound_fields:
+  - format: "{field1_name}-{field2_name}" # 输出格式，其中 field1_name 和 field2_name 为已配置的字段名
+                                          # 也可以配置 native_tag 作为输入字段，但注意已配置字段的优先级更高
+    output: # 参考 fields 中 output 的说明进行配置
+      attribute_name: "xyz"
+      metric_name: "xyz"
+      rewrite_native_tag:
+        name: version
+        remap: dict_1
+        condition:
+          enum_whitelist: []
+          enum_blacklist: []
+      rewrite_response_status:
+        ok_values: []
+        client_error_values: []
+        server_error_values: []
+        default_status: ""
+      priority: 0
+  dictionaries:
+  - name: dict_1
+    entries:
+    - key: key1
+      value: value1
+    - key: key2
+      value: value2
+    default: value3
 ```
-注意，其中 field_type 的不同值会影响到该字段的提取方式，具体如下：
-- `http_url_field`：从 HTTP URL 末尾的参数中提取字段，URL 末尾形如：`?key=value&key2=value2`
-- `header_field`：从 HTTP/Dubbo/SofaRPC/...等协议的 Header 部分提取字段，例如 HTTP 的 Header 形如：`key: value`
-- `payload_json_value`：从 Json Payload 中提取字段，形如：`"key": 1`,  或者 `"key": "value"`,  或者 `"key": None`, 等等 ...
-- `payload_xml_value`：从 XML Payload 中提取字段，形如：`<key attr="xxx">value</key>`
-- `payload_hessian2_value`：Payload 使用 Hessian2 编码，从中提取字段
 
 #### 脱敏协议列表 {#processors.request_log.tag_extraction.obfuscate_protocols}
 
@@ -9333,10 +9780,36 @@ processors:
 
 **详细描述**:
 
-FlowMap 中存储的最大并发 Flow 数量。该配置同时影响 RRT 缓存容量。
-例如：`rrt-cache-capacity` = `flow-count-limit`。当 `rrt-cache-capacity` 不足时，
-将无法计算 L7 的 RRT。当 `inputs.cbpf.common.capture_mode` 为 `物理网络镜像` 并且该配置值小于等于 65535 时，
-将会被强制设置为 u32::MAX。
+FlowMap 中存储的最大并发 Flow 数量。当 `inputs.cbpf.common.capture_mode` 为 `物理网络镜像` 并且该配置值小于等
+于 65535 时，将会被强制设置为 u32::MAX。
+
+#### RRT 缓存容量 {#processors.flow_log.tunning.rrt_cache_capacity}
+
+**标签**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.flow_log.tunning.rrt_cache_capacity`
+
+**默认值**:
+```yaml
+processors:
+  flow_log:
+    tunning:
+      rrt_cache_capacity: 16000
+```
+
+**模式**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [1024, 64000000] |
+
+**详细描述**:
+
+FlowMap 中 RRT Cache 表的容量。该表用于计算 RRT 延迟指标，过大会导致采集器内存占用高，过小会导致RRT指标缺失。
 
 #### 内存池大小 {#processors.flow_log.tunning.memory_pool_size}
 
@@ -10547,6 +11020,12 @@ outputs:
 开启此特性将增加 deepflow-agent 的 CPU 消耗。
 
 # 插件 {#plugins}
+
+插件支持
+同时匹配插件和自定义提取策略时，优先级为：
+1. 插件提取
+2. 自定义字段提取
+3. 采集器默认提取
 
 ## Wasm 插件列表 {#plugins.wasm_plugins}
 

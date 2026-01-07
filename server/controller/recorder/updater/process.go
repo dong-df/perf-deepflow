@@ -80,11 +80,6 @@ func NewProcess(wholeCache *cache.Cache, cloudData []cloudmodel.Process) *Proces
 	return updater
 }
 
-func (p *Process) getDiffBaseByCloudItem(cloudItem *cloudmodel.Process) (diffBase *diffbase.Process, exits bool) {
-	diffBase, exits = p.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
 func (p *Process) generateDBItemToAdd(cloudItem *cloudmodel.Process) (*metadbmodel.Process, bool) {
 	deviceType, deviceID := p.cache.ToolDataSet.GetProcessDeviceTypeAndID(cloudItem.ContainerID, cloudItem.VTapID)
 	// add pod node id
@@ -191,7 +186,7 @@ func (p *Process) generateUpdateInfo(diffBase *diffbase.Process, cloudItem *clou
 			}
 		}
 		gid, ok := p.cache.ToolDataSet.GetProcessGIDByIdentifier(
-			p.cache.ToolDataSet.GetProcessIdentifier(diffBase.Name, podGroupID, cloudItem.VTapID, cloudItem.CommandLine),
+			p.cache.ToolDataSet.GetProcessIdentifier(diffBase.Name, cloudItem.ProcessName, podGroupID, cloudItem.VTapID, cloudItem.CommandLine),
 		)
 		if !ok {
 			log.Errorf("process %s gid not found", diffBase.Lcuuid, p.metadata.LogPrefixes)

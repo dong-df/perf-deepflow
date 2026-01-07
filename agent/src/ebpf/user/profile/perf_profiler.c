@@ -38,6 +38,7 @@
 #include "perf_profiler.h"
 #include "../elf.h"
 #include "../load.h"
+#include "../unwind_tracer.h"
 #include "../../kernel/include/perf_profiler.h"
 #include "../perf_reader.h"
 #include "../bihash_8_8.h"
@@ -710,7 +711,21 @@ void build_prog_jump_tables(struct bpf_tracer *tracer)
 	insert_prog_to_map(tracer, MAP_CP_PROGS_JMP_PE_NAME,
 			   PROG_PYTHON_UNWIND_FOR_PE,
 			   PROG_PYTHON_UNWIND_PE_IDX);
-        // TODO: 增加 lua 相关的程序
+	insert_prog_to_map(tracer, MAP_CP_PROGS_JMP_PE_NAME,
+			   PROG_LUA_UNWIND_FOR_PE,
+			   PROG_LUA_UNWIND_PE_IDX);
+	insert_prog_to_map(tracer, MAP_CP_PROGS_JMP_PE_NAME,
+			   PROG_PHP_UNWIND_FOR_PE,
+			   PROG_PHP_UNWIND_PE_IDX);
+	insert_prog_to_map(tracer, MAP_CP_PROGS_JMP_PE_NAME,
+			   PROG_V8_UNWIND_FOR_PE,
+			   PROG_V8_UNWIND_PE_IDX);
+	insert_prog_to_map(tracer, MAP_CP_PROGS_JMP_PE_NAME,
+			   PROG_DWARF_UNWIND_BEFORE_PHP_FOR_PE,
+			   PROG_DWARF_UNWIND_BEFORE_PHP_PE_IDX);
+	insert_prog_to_map(tracer, MAP_CP_PROGS_JMP_PE_NAME,
+			   PROG_DWARF_UNWIND_BEFORE_V8_FOR_PE,
+			   PROG_DWARF_UNWIND_BEFORE_V8_PE_IDX);
 	extended_prog_jump_tables(tracer);
 }
 
@@ -811,6 +826,21 @@ int start_continuous_profiler(int freq, int java_syms_update_delay,
 			     bpf_bin_buffer, buffer_sz, tps,
 			     0, release_profiler, create_profiler,
 			     (void *)callback, cb_ctx, freq);
+	if (tracer == NULL && k_type == K_TYPE_VER_5_2_PLUS) {
+		/* Fallback: 5.2+ variant too complex for verifier, try common binary */
+		ebpf_warning
+		    ("[CP] 5.2+ DWARF profiler load failed, falling back to common (no DWARF/unwind).\n");
+		k_type = K_TYPE_COMM;
+		snprintf(bpf_load_buffer_name, NAME_LEN,
+			 "continuous-profiler-common");
+		bpf_bin_buffer = (void *)perf_profiler_common_ebpf_data;
+		buffer_sz = sizeof(perf_profiler_common_ebpf_data);
+		set_dwarf_enabled(false);
+		tracer = setup_bpf_tracer(CP_TRACER_NAME, bpf_load_buffer_name,
+					  bpf_bin_buffer, buffer_sz, tps,
+					  0, release_profiler, create_profiler,
+					  (void *)callback, cb_ctx, freq);
+	}
 	if (tracer == NULL)
 		return (-1);
 

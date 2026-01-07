@@ -78,11 +78,6 @@ func NewConfigMap(wholeCache *cache.Cache, cloudData []cloudmodel.ConfigMap) *Co
 	return updater
 }
 
-func (h *ConfigMap) getDiffBaseByCloudItem(cloudItem *cloudmodel.ConfigMap) (diffBase *diffbase.ConfigMap, exists bool) {
-	diffBase, exists = h.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
 func (h *ConfigMap) generateDBItemToAdd(cloudItem *cloudmodel.ConfigMap) (*metadbmodel.ConfigMap, bool) {
 	podClusterID, exists := h.cache.ToolDataSet.GetPodClusterIDByLcuuid(cloudItem.PodClusterLcuuid)
 	if !exists {
@@ -115,7 +110,7 @@ func (h *ConfigMap) generateDBItemToAdd(cloudItem *cloudmodel.ConfigMap) (*metad
 	}
 	dbItem := &metadbmodel.ConfigMap{
 		Name:           cloudItem.Name,
-		Data:           string(yamlData),
+		Data:           yamlData,
 		DataHash:       cloudItem.DataHash,
 		PodNamespaceID: podNamespaceID,
 		PodClusterID:   podClusterID,
@@ -140,13 +135,19 @@ func (h *ConfigMap) generateUpdateInfo(diffBase *diffbase.ConfigMap, cloudItem *
 	if diffBase.DataHash != cloudItem.DataHash {
 		mapInfo["data_hash"] = cloudItem.DataHash
 
-		yamlData, err := yaml.JSONToYAML([]byte(cloudItem.Data))
+		yamlDataBytes, err := yaml.JSONToYAML([]byte(cloudItem.Data))
 		if err != nil {
 			log.Errorf("failed to convert %s JSON data: %v to YAML: %s", h.resourceType, cloudItem.Data, h.metadata.LogPrefixes)
 			return nil, nil, false
 		}
-		mapInfo["data"] = string(yamlData)
-		structInfo.Data.Set(diffBase.Data, string(yamlData))
+
+		if compressedData, err := metadbmodel.AutoCompressedBytes(yamlDataBytes).Value(); err != nil {
+			log.Errorf("failed to compress %s YAML data: %v: %s", h.resourceType, yamlDataBytes, h.metadata.LogPrefixes)
+			return nil, nil, false
+		} else {
+			mapInfo["compressed_data"] = compressedData
+			structInfo.Data.Set(diffBase.Data, string(yamlDataBytes))
+		}
 	}
 	return structInfo, mapInfo, len(mapInfo) > 0
 }

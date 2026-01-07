@@ -73,14 +73,10 @@ func NewHost(wholeCache *cache.Cache, cloudData []cloudmodel.Host) *Host {
 	return updater
 }
 
-func (h *Host) getDiffBaseByCloudItem(cloudItem *cloudmodel.Host) (diffBase *diffbase.Host, exists bool) {
-	diffBase, exists = h.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
 func (h *Host) generateDBItemToAdd(cloudItem *cloudmodel.Host) (*metadbmodel.Host, bool) {
 	dbItem := &metadbmodel.Host{
 		Name:       cloudItem.Name,
+		UID:        ctrlrcommon.GenerateResourceShortUUID(ctrlrcommon.RESOURCE_TYPE_HOST_EN),
 		IP:         cloudItem.IP,
 		Hostname:   cloudItem.Hostname,
 		Type:       cloudItem.Type,

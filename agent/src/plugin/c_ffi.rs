@@ -20,7 +20,6 @@ use std::sync::{Arc, Weak};
 use public::enums::IpProtocol;
 
 use crate::flow_generator::protocol_logs::pb_adapter::KeyVal;
-use crate::flow_generator::protocol_logs::LogMessageType;
 use crate::plugin::PluginCounterInfo;
 use crate::{common::l7_protocol_log::ParseParam, flow_generator::protocol_logs::L7ResponseStatus};
 
@@ -28,6 +27,7 @@ use super::{
     shared_obj::SoPluginCounter, CustomInfo, CustomInfoRequest, CustomInfoResp, CustomInfoTrace,
 };
 use public::counter::{Countable, RefCountable};
+use public::l7_protocol::LogMessageType;
 
 pub const INIT_FUNC_SYM: &'static str = "init";
 pub const CHECK_PAYLOAD_FUNC_SYM: &'static str = "on_check_payload";
@@ -131,6 +131,8 @@ pub struct Response {
     pub(super) code: i32,
     pub(super) exception: [u8; 128],
     pub(super) result: [u8; 512],
+    pub(super) req_type: [u8; 64],
+    pub(super) endpoint: [u8; 128],
 }
 impl std::fmt::Debug for Response {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -277,6 +279,8 @@ impl TryFrom<ParseInfo> for CustomInfo {
                         code: Some(resp.code),
                         exception: c_str_to_string(&resp.exception).unwrap_or_default(),
                         result: c_str_to_string(&resp.result).unwrap_or_default(),
+                        req_type: c_str_to_string(&resp.req_type).unwrap_or_default(),
+                        endpoint: c_str_to_string(&resp.endpoint).unwrap_or_default(),
                     },
                 )
             }
@@ -326,6 +330,7 @@ impl TryFrom<ParseInfo> for CustomInfo {
 pub struct CheckResult {
     pub proto: u8,
     pub proto_name: [u8; 16],
+    pub direction: u8,
 }
 
 pub const ACTION_ERROR: u8 = 0;

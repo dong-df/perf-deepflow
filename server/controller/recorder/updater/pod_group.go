@@ -76,11 +76,6 @@ func NewPodGroup(wholeCache *cache.Cache, cloudData []cloudmodel.PodGroup) *PodG
 	return updater
 }
 
-func (p *PodGroup) getDiffBaseByCloudItem(cloudItem *cloudmodel.PodGroup) (diffBase *diffbase.PodGroup, exists bool) {
-	diffBase, exists = p.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
 func (p *PodGroup) generateDBItemToAdd(cloudItem *cloudmodel.PodGroup) (*metadbmodel.PodGroup, bool) {
 	podNamespaceID, exists := p.cache.ToolDataSet.GetPodNamespaceIDByLcuuid(cloudItem.PodNamespaceLcuuid)
 	if !exists {
@@ -113,9 +108,10 @@ func (p *PodGroup) generateDBItemToAdd(cloudItem *cloudmodel.PodGroup) (*metadbm
 		Name:           cloudItem.Name,
 		Type:           cloudItem.Type,
 		Label:          cloudItem.Label,
-		Metadata:       string(yamlMetadata),
+		NetworkMode:    cloudItem.NetworkMode,
+		Metadata:       yamlMetadata,
 		MetadataHash:   cloudItem.MetadataHash,
-		Spec:           string(yamlSpec),
+		Spec:           yamlSpec,
 		SpecHash:       cloudItem.SpecHash,
 		PodNum:         cloudItem.PodNum,
 		PodNamespaceID: podNamespaceID,
@@ -151,6 +147,10 @@ func (p *PodGroup) generateUpdateInfo(diffBase *diffbase.PodGroup, cloudItem *cl
 		mapInfo["label"] = cloudItem.Label
 		structInfo.Label.Set(diffBase.Label, cloudItem.Label)
 	}
+	if diffBase.NetworkMode != cloudItem.NetworkMode {
+		mapInfo["network_mode"] = cloudItem.NetworkMode
+		structInfo.NetworkMode.Set(diffBase.NetworkMode, cloudItem.NetworkMode)
+	}
 	if diffBase.RegionLcuuid != cloudItem.RegionLcuuid {
 		mapInfo["region"] = cloudItem.RegionLcuuid
 		structInfo.RegionLcuuid.Set(diffBase.RegionLcuuid, cloudItem.RegionLcuuid)
@@ -158,26 +158,36 @@ func (p *PodGroup) generateUpdateInfo(diffBase *diffbase.PodGroup, cloudItem *cl
 	if diffBase.MetadataHash != cloudItem.MetadataHash {
 		mapInfo["metadata_hash"] = cloudItem.MetadataHash
 
-		yamlMetadata, err := yaml.JSONToYAML([]byte(cloudItem.Metadata))
+		yamlMetadataBytes, err := yaml.JSONToYAML([]byte(cloudItem.Metadata))
 		if err != nil {
 			log.Errorf("failed to convert %s metadata JSON (data: %v) to YAML: %s", p.resourceType, cloudItem.Metadata, p.metadata.LogPrefixes)
 			return nil, nil, false
 		}
-		mapInfo["metadata"] = string(yamlMetadata)
-		structInfo.Metadata.Set(diffBase.Metadata, string(yamlMetadata))
+		if compressedBytes, err := metadbmodel.AutoCompressedBytes(yamlMetadataBytes).Value(); err != nil {
+			log.Errorf("failed to compress %s YAML data: %v: %s", p.resourceType, yamlMetadataBytes, err.Error(), p.metadata.LogPrefixes)
+			return nil, nil, false
+		} else {
+			mapInfo["compressed_metadata"] = compressedBytes
+		}
+		structInfo.Metadata.Set(diffBase.Metadata, string(yamlMetadataBytes))
 	} else {
 		structInfo.Metadata.Set(diffBase.Metadata, diffBase.Metadata) // set for resource event, because it publish combined config of metadata and spec
 	}
 	if diffBase.SpecHash != cloudItem.SpecHash {
 		mapInfo["spec_hash"] = cloudItem.SpecHash
 
-		yamlSpec, err := yaml.JSONToYAML([]byte(cloudItem.Spec))
+		yamlSpecBytes, err := yaml.JSONToYAML([]byte(cloudItem.Spec))
 		if err != nil {
 			log.Errorf("failed to convert %s spec JSON (data: %v) to YAML: %s", p.resourceType, cloudItem.Spec, p.metadata.LogPrefixes)
 			return nil, nil, false
 		}
-		mapInfo["spec"] = string(yamlSpec)
-		structInfo.Spec.Set(diffBase.Spec, string(yamlSpec))
+		if compressedBytes, err := metadbmodel.AutoCompressedBytes(yamlSpecBytes).Value(); err != nil {
+			log.Errorf("failed to compress %s YAML data: %v: %s", p.resourceType, yamlSpecBytes, err.Error(), p.metadata.LogPrefixes)
+			return nil, nil, false
+		} else {
+			mapInfo["compressed_spec"] = compressedBytes
+		}
+		structInfo.Spec.Set(diffBase.Spec, string(yamlSpecBytes))
 	} else {
 		structInfo.Spec.Set(diffBase.Spec, diffBase.Spec) // set for resource event, because it publish combined config of metadata and spec
 	}

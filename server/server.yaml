@@ -93,6 +93,13 @@ controller:
     port: 20825
     timeout: 30
 
+  # deepflow querier js config
+  querier-js-service:
+    enabled: false
+    host: querier-js
+    port: 30420
+    timeout: 30
+
   # deepflow fpermit service config
   fpermit:
     enabled: false
@@ -140,6 +147,7 @@ controller:
   dm:
     enabled: false
     dsn: DM8DSN
+    # schema should not have the same name as user-name
     schema: deepflow
     user-name: root
     user-password: deepflow
@@ -242,10 +250,6 @@ controller:
       cloud:
         # Kubernetes数据获取的时间间隔，单位：秒
         kubernetes_gather_interval: 30
-        # 阿里公有云API获取区域列表时，需要指定一个区域
-        aliyun_region_name: cn-beijing
-        # AWS API获取区域列表时，需要指定一个区域，并通过这个区域区分国际版和国内版
-        aws_region_name: cn-north-1
         # 配置宿主机IP文件
         hostname_to_ip_file: /etc/hostname_to_ip.csv
         # 开启debug模式，支持debug云平台API/SDK原始数据
@@ -295,6 +299,15 @@ controller:
         event:
           # context lines count for config diff
           config_diff_context: 3
+        self_heal: 
+          enabled: true
+          resources:
+          #  - pod_service
+          #  - pod_group
+          #  - pod
+          #  - config_map
+        tagrecorder_self_heal: 
+          enabled: true
   tagrecorder:
     # size of data in batch operation for MySQL
     mysql_batch_size: 1000
@@ -308,6 +321,12 @@ controller:
       host: 127.0.0.1
       port: 123
       timeout: 1
+
+    # grpc service push config
+    push:
+      enabled: true
+      # unit: second , min: 1 max: 10
+      delay-max: 0
 
     trident-type-for-unknow-vtap: 0
 
@@ -334,6 +353,9 @@ controller:
     # clean up the data and cache of the table kubernetes_cluster according to the data 
     # that was not synchronized before a certain period of time 
     clear-kubernetes-time: 600
+
+    # auto grpc message size change to smaller interval, unit: second
+    auto-grpc-buffer-size-interval: 3600
 
     ## plaform data real refresh delay time
     ## uint: s, default: 1
@@ -445,6 +467,10 @@ querier:
     # Trace Tree 批次写入大小
     write_batch_size: 1000
     debug_sql_len_max: 1000
+    # 多 trace_id 场景下，允许迭代找出互相关联的 trace_id 的最大迭代次数，注意区别上面的 trace_id_query_iterations
+    multi_trace_id_max_iterations: 30
+	# 检测请求距离现在的时间，如果小于这个时间不要记录 TraceTree (目前用于 async flow 上报了请求还没响应的场景), unit: s
+    trace_tree_cache_delay: 120
 
   # deepflow-app相关配置
   deepflow-app:
@@ -729,6 +755,8 @@ ingester:
   #    tables-contain: 1s_local
   #  - database: profile
   #  - database: application_log
+  #  - database: event
+  #    tables-contain: file_event_local
 
   ## ingester模块是否启用，默认启用, 若不启用(表示处于单独的控制器)
   #ingester-enabled: true

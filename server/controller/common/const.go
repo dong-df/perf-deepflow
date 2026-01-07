@@ -353,6 +353,7 @@ const (
 	H3C               = 31
 	FUSIONCOMPUTE     = 32
 	SCP               = 33
+	RUIJIE            = 34
 
 	OPENSTACK_EN         = "openstack"
 	VSPHERE_EN           = "vsphere"
@@ -386,6 +387,7 @@ const (
 	H3C_EN               = "h3c"
 	FUSIONCOMPUTE_EN     = "fusioncompute"
 	SCP_EN               = "scp"
+	RUIJIE_EN            = "ruijie"
 
 	TENCENT_CH          = "腾讯云"
 	ALIYUN_CH           = "阿里云"
@@ -399,6 +401,7 @@ const (
 	SUGON_CH            = "曙光云"
 	VOLCENGINE_CH       = "火山云"
 	H3C_CH              = "华三云"
+	RUIJIE_CH           = "锐捷云"
 
 	OPENSTACK_CH     = "OpenStack"
 	VSPHERE_CH       = "vSphere"
@@ -574,6 +577,10 @@ const (
 )
 
 const (
+	DEFAULT_POD_NAMESPACE = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+)
+
+const (
 	POD_NODE_TYPE_MASTER = 1
 	POD_NODE_TYPE_NODE   = 2
 
@@ -582,6 +589,11 @@ const (
 
 	POD_NODE_SERVER_TYPE_HOST = 1
 	POD_NODE_SERVER_TYPE_VM   = 2
+)
+
+const (
+	POD_GROUP_POD_NETWORK  = 1
+	POD_GROUP_HOST_NETWORK = 2
 )
 
 const (
@@ -793,6 +805,8 @@ const (
 	CUSTOM_SERVICE_TYPE_CHOST       = 3
 	CUSTOM_SERVICE_TYPE_POD_SERVICE = 4
 	CUSTOM_SERVICE_TYPE_POD_GROUP   = 5
+	CUSTOM_SERVICE_TYPE_POD         = 6
+	CUSTOM_SERVICE_TYPE_HOST        = 7
 
 	CUSTOM_SERVICE_MATCH_TYPE_NAME = 1
 	CUSTOM_SERVICE_MATCH_TYPE_UID  = 2

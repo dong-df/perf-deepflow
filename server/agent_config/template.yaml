@@ -37,13 +37,23 @@ global:
     # unit: MiB
     # range: [128, 100000]
     # enum_options: []
-    # modification: hot_update
+    # modification: agent_restart
     # ee_feature: false
     # description:
     #   en: |-
     #     deepflow-agent uses cgroups to limit memory usage.
+    #
+    #     Note:
+    #     - Memory of the dedicated deepflow-agent is not limited
+    #     - Memory limits for container deepflow-agent are enforced by container
+    #     - Memory limits for container deepflow-agent in the same cluster need to be consistent
     #   ch: |-
-    #     deepflow-agent 使用 cgroups 限制自身的 memory 用量.
+    #     deepflow-agent 使用 cgroups 限制自身的 memory 用量。
+    #
+    #     注意：
+    #     - 专属采集器内存不受限制
+    #     - 容器采集器内存限制由容器管理工具来实现
+    #     - 同集群的容器采集器内存限制需要一致
     # upgrade_from: max_memory
     max_memory: 768
     # type: int
@@ -630,8 +640,13 @@ global:
     #   en: |-
     #     Whether to synchronize the clock to the deepflow-server, this behavior
     #     will not change the time of the deepflow-agent running environment.
+    #
+    #     Notice: Before enabling NTP, the controller needs to first start the NTP service. The agent will
+    #     only continue to work after the time synchronization is complete.
     #   ch: |-
     #     deepflow-agent 是否向 deepflow-server 做 NTP 同步的开关。
+    #
+    #     注意：开启 NTP 前控制器需要先开启 NTP 服务，直到完成同步时间后采集器才会继续运行。
     # upgrade_from: ntp_enabled
     enabled: false
     # type: duration
@@ -1456,7 +1471,7 @@ inputs:
     #   ch: 匹配语言
     # unit:
     # range: []
-    # enum_options: [java, golang, python, nodejs, dotnet]
+    # enum_options: [java, golang, python, lua, php, nodejs, dotnet]
     # modification: hot_update
     # ee_feature: false
     # description:
@@ -1625,6 +1640,21 @@ inputs:
         rewrite_name: $3
         enabled_features: [ebpf.profile.on_cpu, proc.gprocess_info]
       - match_regex: \bpython(\S)*( +-\S+)* +(\S*/)*([^ /]+)
+        match_type: cmdline_with_args
+        only_in_container: false
+        rewrite_name: $4
+        enabled_features: [ebpf.profile.on_cpu, proc.gprocess_info]
+      - match_regex: \b(?:lua|luajit)(\S)*( +-\S+)* +(\S*/)*([^ /]+)
+        match_type: cmdline_with_args
+        only_in_container: false
+        rewrite_name: $5
+        enabled_features: [ebpf.profile.on_cpu, proc.gprocess_info]
+      - match_regex: \bphp(\d+)?(-fpm|-cli|-cgi)?( +-\S+)* +(\S*/)*([^ /]+\.php)
+        match_type: cmdline_with_args
+        only_in_container: false
+        rewrite_name: $5
+        enabled_features: [ebpf.profile.on_cpu, proc.gprocess_info]
+      - match_regex: \b(node|nodejs)( +--\S+)* +(\S*/)*([^ /]+\.js)
         match_type: cmdline_with_args
         only_in_container: false
         rewrite_name: $4
@@ -2719,7 +2749,7 @@ inputs:
           #     - 如果上面没有搜到 "libssl.so" 也可能是静态编译了，这时候我们可以通过下面方式确认：
           #       执行命令 `sudo nm /proc/<PID>/exe | grep SSL_write` 若包含 `SSL_write` 相关信息如：`0000000000502ac0 T SSL_write`
           #       则说明该进程正在使用静态编译的 openssl 库。
-          #       
+          #
           #     启用后，deepflow-agent 将获取符合正则表达式匹配的进程信息，并 Hook openssl 库的相应加解密接口。
           #     在日志中您会看到类似如下信息：
           #     ```
@@ -3333,6 +3363,27 @@ inputs:
         #     的文件 IO 事件将被忽略。
         # upgrade_from: static_config.ebpf.io-event-minimal-duration
         minimal_duration: 1ms
+        # type: bool
+        # name:
+        #   en: Virtual File Collection Enabled
+        #   ch: 启用虚拟文件采集
+        # unit:
+        # range: []
+        # enum_options: []
+        # modification: agent_restart
+        # ee_feature: false
+        # description:
+        #   en: |-
+        #     When set to true, the agent will collect file I/O events generated on
+        #     virtual file systems (such as /proc, /sys, /run, and other kernel
+        #     pseudo file systems).
+        #     When set to false, the agent will not collect file I/O events from
+        #     virtual file systems.
+        #   ch: |-
+        #     当设置为 true 时，deepflow-agent 将采集发生在虚拟文件系统上的文件
+        #     I/O 事件（例如 /proc、/sys、/run 等由内核动态生成的伪文件系统）。
+        #     当设置为 false 时，将不会采集虚拟文件系统上的文件 I/O 事件。
+        enable_virtual_file_collect: false
     # type: section
     # name: Profile
     # description:
@@ -3720,6 +3771,69 @@ inputs:
         #     on-cpu 函数调用栈压缩，可以将带宽消耗降低 `x` 倍，但会使得 agent 额外消耗 `y%` 的 CPU。
         # upgrade_from: static_config.ebpf.preprocess.stack-compression
         stack_compression: true
+      # type: section
+      # name:
+      #   en: Language-specific Profiling
+      #   ch: 语言特定剖析
+      # description:
+      #   en: |-
+      #     Control which interpreter languages to profile. Disabling unused languages can save ~5-6 MB memory per language.
+      #     Total memory: ~17-20 MB (all enabled), ~6.1 MB (Python only), ~5.2 MB (PHP only), ~6.4 MB (Node.js only).
+      #   ch: |-
+      #     控制对哪些解释型语言进行剖析。禁用不使用的语言可以节省每个语言约 5-6 MB 内存。
+      #     总内存占用：~17-20 MB（全部启用），~6.1 MB（仅 Python），~5.2 MB（仅 PHP），~6.4 MB（仅 Node.js）。
+      languages:
+        # type: bool
+        # name:
+        #   en: Python profiling disabled
+        #   ch: 禁用 Python 剖析
+        # unit:
+        # range: []
+        # enum_options: []
+        # modification: agent_restart
+        # ee_feature: false
+        # description:
+        #   en: |-
+        #     Disable Python interpreter profiling. When disabled, Python process stack traces will not be collected,
+        #     saving approximately 6.1 MB of kernel memory (python_tstate_addr_map, python_unwind_info_map, python_offsets_map).
+        #   ch: |-
+        #     禁用 Python 解释器剖析。禁用后将不采集 Python 进程的函数调用栈，
+        #     可节省约 6.1 MB 内核内存（python_tstate_addr_map、python_unwind_info_map、python_offsets_map）。
+        python_disabled: false
+        # type: bool
+        # name:
+        #   en: PHP profiling disabled
+        #   ch: 禁用 PHP 剖析
+        # unit:
+        # range: []
+        # enum_options: []
+        # modification: agent_restart
+        # ee_feature: false
+        # description:
+        #   en: |-
+        #     Disable PHP interpreter profiling. When disabled, PHP process stack traces will not be collected,
+        #     saving approximately 5.2 MB of kernel memory (php_unwind_info_map, php_offsets_map).
+        #   ch: |-
+        #     禁用 PHP 解释器剖析。禁用后将不采集 PHP 进程的函数调用栈，
+        #     可节省约 5.2 MB 内核内存（php_unwind_info_map、php_offsets_map）。
+        php_disabled: false
+        # type: bool
+        # name:
+        #   en: Node.js profiling disabled
+        #   ch: 禁用 Node.js 剖析
+        # unit:
+        # range: []
+        # enum_options: []
+        # modification: agent_restart
+        # ee_feature: false
+        # description:
+        #   en: |-
+        #     Disable Node.js (V8) interpreter profiling. When disabled, Node.js process stack traces will not be collected,
+        #     saving approximately 6.4 MB of kernel memory (v8_unwind_info_map).
+        #   ch: |-
+        #     禁用 Node.js（V8）解释器剖析。禁用后将不采集 Node.js 进程的函数调用栈，
+        #     可节省约 6.4 MB 内核内存（v8_unwind_info_map）。
+        nodejs_disabled: false
     # type: section
     # name:
     #   en: Tunning
@@ -3781,9 +3895,11 @@ inputs:
       #     value is `2^n (5 <= n <= 13)`. Used for perf data transfer. If the
       #     value is between `2^n` and `2^(n+1)`, it will be automatically adjusted
       #     by the ebpf configurator to the minimum value `2^n`.
+      #     The page size is 4 KB.
       #   ch: |-
       #     内核共享内存占用的页数。值为 `2^n (5 <= n <= 13)`。用于 perf 数据传输。
       #     如果值在 `2^n` 和 `2^(n+1)` 之间，将自动调整到最小值 `2^n`。
+      #     页的大小为4KB。
       # upgrade_from: static_config.ebpf.perf-pages-count
       perf_pages_count: 128
       # type: int
@@ -5042,6 +5158,69 @@ processors:
       #     新周期。
       # upgrade_from: static_config.l7-protocol-inference-ttl
       inference_result_ttl: 60s
+      # type: dict
+      # name:
+      #   en: Inference whitelist
+      #   ch: 推理白名单
+      # unit:
+      # range: []
+      # enum_options: []
+      # modification: hot_update
+      # ee_feature: false
+      # description:
+      #   en: |-
+      #     Application protocol port whitelist, currently only supports eBPF traffic. When eBPF data is on the whitelist,
+      #     the application table is no longer used to query the application protocol. The corresponding application protocol
+      #     is obtained by polling all currently supported protocols. Having too much data on the whitelist greatly reduces the
+      #     processing performance of eBPF data.
+      #
+      #     Configuration Key:
+      #     - process_name: Process name, regular expressions are not supported
+      #     - port_list: Port Whitelist
+      #   ch: |-
+      #     应用协议端口白名单列表，目前仅支持 eBPF 流量。当 eBPF 数据在白名单列表中时，不会再使用应用表查询应用协议，
+      #     对应的应用协议通过轮训目前所有支持的协议来获取，白名单数据过多会降低 eBPF 数据的处理性能。
+      #
+      #     配置键：
+      #     - process_name: 进程名称，不支持正则表达式
+      #     - port_list: 端口白名单列表
+      # ---
+      # type: string
+      # name:
+      #   en: Process name
+      #   ch: 进程名称
+      # unit:
+      # range: []
+      # enum_options: []
+      # modification: agent_restart
+      # ee_feature: false
+      # description:
+      #   en: |-
+      #     Process name
+      #   ch: |-
+      #     进程名称
+      # ---
+      # process_name: ""
+      # ---
+      # type: int
+      # name:
+      #   en: Port list
+      #   ch: 端口列表
+      # unit:
+      # range: []
+      # enum_options: []
+      # modification: agent_restart
+      # ee_feature: false
+      # description:
+      #   en: |-
+      #     Port list
+      #   ch: |-
+      #     端口列表
+      # ---
+      # port_list: []
+      inference_whitelist:
+      - process_name: envoy
+        port_list: [15001, 15006]
       # type: string
       # name:
       #   en: Enabled Protocols
@@ -5373,52 +5552,6 @@ processors:
           #   ch: |-
           #     开启后所有 gRPC 数据包都认为是 `stream` 类型，并且会将 `data` 类型数据包上报，同时延迟计算的响应使用带有 `grpc-status` 字段的。
           streaming_data_enabled: false
-      # type: dict
-      # name:
-      #   en: custom protocol parsing
-      #   ch: 自定义协议解析
-      # modification: agent_restart
-      # ee_feature: true
-      # description:
-      #   en: |-
-      #     Custom protocol parsing configuration, which can be used to parse custom protocols through simple rules.
-      #     Example:
-      #     ```yaml
-      #     - protocol_name: "your_protocol_name" # Protocol name, corresponding to l7_flow_log.l7_protocol_str
-      #       pre_filter:
-      #         port_list: 1-65535 # Pre-filter port, which can improve parsing performance
-      #       request_characters:  # Multiple features are ORed
-      #         - character: # Multiple match_keywords are ANDed
-      #           - match_keyword: abc  # Feature string
-      #             match_type: "string" # Possible values: "string", "hex"
-      #             match_ignore_case: false # wheather ignore case when match keywords, when match_type == string effected, default: false
-      #             match_from_beginning: false # Whether to match from the beginning of the payload
-      #       response_characters:
-      #         - character:
-      #           - match_keyword: 0123af
-      #             match_type: "hex"
-      #             match_from_beginning: false
-      #     ```
-      #   ch: |-
-      #     自定义协议解析配置，支持通过简单的规则识别用户自定义的 L7 协议。
-      #     示例：
-      #     ```yaml
-      #     - protorol_name: "your_protocol_name" # 协议名称，对应 l7_flow_log.l7_protocol_str，注意：必须存在一个 `processors.request_log.tag_extraction.custom_field_policies` 配置，否则无法上报识别结果
-      #       pre_filter:
-      #         port_list: 1-65535 # 预过滤端口，可以提高解析性能
-      #       request_characters:  # 多个特征之间是 OR 的关系
-      #         - character: # 多个 match_keyword 之间是 AND 的关系
-      #           - match_keyword: abc  # 特征字符串
-      #             match_type: "string" # 取值："string", "hex"
-      #             match_ignore_case: false # 匹配特征字符串是否忽略大小写，当 match_type == string 时生效，默认值: false
-      #             match_from_begining: false # 是否需要从 Payload 头部开始匹配
-      #       response_characters:
-      #         - character:
-      #           - match_keyword: 0123af
-      #             match_type: "hex"
-      #             match_from_begining: false
-      #     ```
-      custom_protocols: []
     # type: section
     # name:
     #   en: Filters
@@ -6155,86 +6288,6 @@ processors:
         # field_name: ""
         HTTP: []
         HTTP2: []
-      # type: dict
-      # name:
-      #   en: Custom Fields Policies
-      #   ch: 自定义字段提取策略
-      # unit:
-      # range: []
-      # modification: agent_restart
-      # ee_feature: true
-      # description:
-      #   en: |-
-      #     Custom field extraction policies, used to extract custom fields from L7 protocols
-      #     Example:
-      #     ```yaml
-      #     - policy_name: "my_policy" # name of current policy
-      #       protocol_name: HTTP # protocol name, if protocol is Grpc, please set it to HTTP2, optional values: HTTP/HTTP2/Dubbo/SofaRPC/Custom/...
-      #       custom_protocol_name: "my_protocol"  # when protocol_name is Custom are effected, and there must be a `processors.request_log.application_protocol_inference.custom_protocols` configuration with the same name, otherwise it cannot be parsed
-      #       port_list: 1-65535
-      #       fields:
-      #       - field_name: "my_field"
-      #         field_match_type: "string"  # optional values: "string"
-      #         field_match_ignore_case: "false" # wheather ignore case when match field, default: false
-      #         field_match_keyword: "abc"  # can be filled with additional characters to improve accuracy, for example `"\"abc\": \""`
-      #
-      #         subfield_match_keyword: "y" # in some cases, we need to extract a subfield, for example, in the HTTP Cookie field, we only need to extract part of it, such as extracting the value corresponding to y from `abc: x=1,y=2,z=3` (the value is `x=1,y=2,z=3`)
-      #         separator_between_subfield_kv_pair: "," # default: empty
-      #         separator_between_subfield_key_and_value: "=" # default: empty
-      #
-      #         field_type: "http_url_field" # field type of extraction, optional values: http_url_field/header_field/payload_json_value/payload_xml_value/payload_hessian2_value, default value: header_field
-      #         traffic_direction: request # could be limited to search only in request (or only in response), optional values: request/response/both, default value: both
-      #         check_value_charset: false # used for checking whether the extracted result is legal
-      #         value_primary_charset: ["digits", "alphabets", "chinese"] # used for checking the character set of the extracted result, optional values: digits/alphabets/chinese
-      #         value_special_charset: ".-_" # used for checking the character set of the extracted result
-      #         attribute_name: "xyz" # this field will appear in the calling log's attribute.xyz, default value is empty, if empty, this field will not be added to attribute
-      #         rewrite_native_tag: version # rewrite can fill in one of the following fields to overwrite the corresponding field value: version/request_type/request_domain/request_resource/request_id/endpoint/response_code/response_exception/response_result/trace_id/span_id/x_request_id/http_proxy_client
-      #         rewrite_response_status: # rewrite response_status field, when response_code is in success_values array, response_status will be set to success, otherwise set to server_error
-      #           success_values: []
-      #         metric_name: "xyz"  # this field will appear in the calling log's metrics.xyz, default value is empty
-      #     ```
-      #     notice: the different values of field_type will affect the extraction method of the field, as follows:
-      #     - `http_url_field`: extract field from HTTP URL parameters at the end of the URL, such as `?key=value&key2=value2`
-      #     - `header_field`: extract field from the Header part of HTTP/Dubbo/SofaRPC/... protocols, such as HTTP Header like `key: value`
-      #     - `payload_json_value`: extract field from Json Payload, such as `"key": 1`, or `"key": "value"`, or `"key": None`, etc.
-      #     - `payload_xml_value`: extract field from XML Payload, such as `<key attr="xxx">value</key>`
-      #     - `payload_hessian2_value`: extract field from Payload encoded with Hessian2
-      #   ch: |-
-      #     自定义字段提取策略，用于通过简单的规则提取 L7 协议中可能存在的自定义字段
-      #     示例：
-      #     ```yaml
-      #     - policy_name: "my_policy" # 策略名称
-      #       protocol_name: HTTP # 协议名称，如要解析 Grpc 请配置为 HTTP2，可选值： HTTP/HTTP2/Dubbo/SofaRPC/Custom/...
-      #       custom_protocol_name: "my_protocol"  # 当 protocol_name 为 Custom 时生效，注意：此时必须存在一个 `processors.request_log.application_protocol_inference.custom_protocols` 配置，且自定义名称协议名称相等，否则无法解析
-      #       port_list: 1-65535
-      #       fields:
-      #       - field_name: "my_field" # 配置的字段
-      #         field_match_type: "string" # 可选值："string"
-      #         field_match_ignore_case: "false" # 当匹配 field 时是否忽略大小写，默认值：false
-      #         field_match_keyword: "abc" # 可以填写额外的字符以提升匹配准确率，例如 `"\"abc\": \""`
-      #
-      #         subfield_match_keyword: "y" # 有些情况下，我们需要提取一个子字段，例如 HTTP 的 Cookie 字段中，我们仅仅只需要提取其中的一部分，例如，我们要从 `abc: x=1,y=2,z=3` 的 Value（`x=1,y=2,z=3`）中提取 y 对应的值
-      #         separator_between_subfield_kv_pair: "," # 用于分割 key-value 键值对的分隔符，默认值：空
-      #         separator_between_subfield_key_and_value: "=" # 用于分割 key 和 value 的分隔符，默认值：空
-      #
-      #         field_type: "http_url_field" # 字段的提取类型，可选值：http_url_field/header_field/payload_json_value/payload_xml_value/payload_hessian2_value，默认值为 `header_field`，含义见下方说明
-      #         traffic_direction: request # 可以限定仅在请求（或仅在响应）中搜索，默认值为 both，可选值：request/response/both
-      #         check_value_charset: false # 可用于检查提取结果是否合法
-      #         value_primary_charset: ["digits", "alphabets", "chinese"] # 提取结果校验字符集，可选值：digits/alphabets/chinese
-      #         value_special_charset: ".-_" # 提取结果校验字符集，额外校验这些特殊字符
-      #         attribute_name: "xyz" # 此时该字段将会出现在调用日志的 attribute.xyz 中，默认值为空，为空时该字段不会加入到 attribute 内
-      #         rewrite_native_tag: version # rewrite 可以填写以下几种字段之一，用于覆写对应字段的值：version/request_type/request_domain/request_resource/request_id/endpoint/response_code/response_exception/response_result/trace_id/span_id/x_request_id/http_proxy_client
-      #         rewrite_response_status: # rewrite response_status 字段，当 response_code 在 success_values 数组中时，会将 response_status 设置为 success，否则设置为 server_error
-      #           success_values: []
-      #         metric_name: "xyz" # 此时该字段将会出现在调用日志的 metrics.xyz 中，默认值为空
-      #     ```
-      #     注意，其中 field_type 的不同值会影响到该字段的提取方式，具体如下：
-      #     - `http_url_field`：从 HTTP URL 末尾的参数中提取字段，URL 末尾形如：`?key=value&key2=value2`
-      #     - `header_field`：从 HTTP/Dubbo/SofaRPC/...等协议的 Header 部分提取字段，例如 HTTP 的 Header 形如：`key: value`
-      #     - `payload_json_value`：从 Json Payload 中提取字段，形如：`"key": 1`,  或者 `"key": "value"`,  或者 `"key": None`, 等等 ...
-      #     - `payload_xml_value`：从 XML Payload 中提取字段，形如：`<key attr="xxx">value</key>`
-      #     - `payload_hessian2_value`：Payload 使用 Hessian2 编码，从中提取字段
-      custom_field_policies: []
       # type: string
       # name:
       #   en: Obfuscate Protocols
@@ -6711,17 +6764,29 @@ processors:
       # ee_feature: false
       # description:
       #   en: |-
-      #     Maximum number of flows that can be stored in FlowMap, It will also affect the capacity of
-      #     the RRT cache, Example: `rrt-cache-capacity` = `flow-count-limit`. When `rrt-cache-capacity`
-      #     is not enough, it will be unable to calculate the rrt of l7. When `inputs.cbpf.common.capture_mode`
-      #     is `Physical Mirror` and concurrent_flow_limit is less than or equal to 65535, it will be forced to u32::MAX.
+      #     Maximum number of flows that can be stored in FlowMap. When `inputs.cbpf.common.capture_mode` is `Physical Mirror`
+      #     and concurrent_flow_limit is less than or equal to 65535, it will be forced to u32::MAX.
       #   ch: |-
-      #     FlowMap 中存储的最大并发 Flow 数量。该配置同时影响 RRT 缓存容量。
-      #     例如：`rrt-cache-capacity` = `flow-count-limit`。当 `rrt-cache-capacity` 不足时，
-      #     将无法计算 L7 的 RRT。当 `inputs.cbpf.common.capture_mode` 为 `物理网络镜像` 并且该配置值小于等于 65535 时，
-      #     将会被强制设置为 u32::MAX。
+      #     FlowMap 中存储的最大并发 Flow 数量。当 `inputs.cbpf.common.capture_mode` 为 `物理网络镜像` 并且该配置值小于等
+      #     于 65535 时，将会被强制设置为 u32::MAX。
       # upgrade_from: static_config.flow.flow-count-limit
       concurrent_flow_limit: 65535
+      # type: int
+      # name:
+      #   en: RRT Cache Capacity
+      #   ch: RRT 缓存容量
+      # unit:
+      # range: [1024, 64000000]
+      # enum_options: []
+      # modification: agent_restart
+      # ee_feature: false
+      # description:
+      #   en: |-
+      #     The capacity of the RRT Cache table in FlowMap. This table is used to calculate RRT latency metrics. If it is too large,
+      #     it will cause high memory usage in the agent; if it is too small, RRT metrics may be missing.
+      #   ch: |-
+      #     FlowMap 中 RRT Cache 表的容量。该表用于计算 RRT 延迟指标，过大会导致采集器内存占用高，过小会导致RRT指标缺失。
+      rrt_cache_capacity: 16000
       # type: int
       # name:
       #   en: Memory Pool Size
@@ -7585,6 +7650,18 @@ outputs:
 #   en: Plugins
 #   ch: 插件
 # description:
+#   en: |-
+#     Plugin support
+#     When both plugins and custom extraction policies match, the priority is:
+#     1. Plugin extraction
+#     2. Custom field policies extraction
+#     3. Agent default extraction
+#   ch: |-
+#     插件支持
+#     同时匹配插件和自定义提取策略时，优先级为：
+#     1. 插件提取
+#     2. 自定义字段提取
+#     3. 采集器默认提取
 plugins:
   # type: string
   # name:

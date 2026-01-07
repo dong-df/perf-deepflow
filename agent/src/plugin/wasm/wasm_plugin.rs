@@ -24,6 +24,10 @@ pub struct AppResponse {
     pub exception: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag = "4")]
     pub result: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "5")]
+    pub r#type: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "6")]
+    pub endpoint: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -67,10 +71,17 @@ pub struct AppInfo {
     pub is_end: ::core::option::Option<bool>,
     #[prost(bool, optional, tag = "22")]
     pub is_async: ::core::option::Option<bool>,
+    /// L2 + L3 + L4 + TapSide
+    #[prost(bool, optional, tag = "23")]
+    pub is_reversed: ::core::option::Option<bool>,
     #[prost(message, repeated, tag = "31")]
     pub attributes: ::prost::alloc::vec::Vec<KeyVal>,
     #[prost(uint32, optional, tag = "32")]
     pub biz_type: ::core::option::Option<u32>,
+    #[prost(string, optional, tag = "33")]
+    pub biz_code: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "34")]
+    pub biz_scenario: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(oneof = "app_info::Info", tags = "10, 11")]
     pub info: ::core::option::Option<app_info::Info>,
 }

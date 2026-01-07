@@ -197,6 +197,46 @@ func TransMultiTag(isMulti bool, field string, dbFields []string, withs []view.N
 	return isMulti, dbFields, withs
 }
 
+func processEnumField(field, db, table string, e *CHEngine) string {
+	transField := field
+	tagEnum := strings.TrimSuffix(field, "_0")
+	tagEnum = strings.TrimSuffix(tagEnum, "_1")
+	tagDes, getTagOK := tag.GetTag(field, db, table, "enum")
+	enumTable := table
+	if slices.Contains([]string{chCommon.DB_NAME_DEEPFLOW_ADMIN, chCommon.DB_NAME_DEEPFLOW_TENANT, chCommon.DB_NAME_PROMETHEUS, chCommon.DB_NAME_EXT_METRICS}, db) {
+		enumTable = chCommon.DB_TABLE_MAP[db][0]
+	}
+	tagDescription, tagOK := tag.TAG_DESCRIPTIONS[tag.TagDescriptionKey{
+		DB: db, Table: enumTable, TagName: field,
+	}]
+	if getTagOK {
+		nameColumn := ""
+		if e.Language != "" {
+			nameColumn = "name_" + e.Language
+		} else {
+			cfgLang := ""
+			if config.Cfg.Language == "en" {
+				cfgLang = "en"
+			} else {
+				cfgLang = "zh"
+			}
+			nameColumn = "name_" + cfgLang
+		}
+		if tagOK {
+			enumFileName := tagDescription.EnumFile
+			if tagEnum == "app_service" || tagEnum == "app_instance" {
+				enumFileName = tagEnum
+				transField = fmt.Sprintf(tagDes.TagTranslator, enumFileName)
+			} else {
+				transField = fmt.Sprintf(tagDes.TagTranslator, nameColumn, enumFileName)
+			}
+		} else {
+			transField = fmt.Sprintf(tagDes.TagTranslator, nameColumn, tagEnum)
+		}
+	}
+	return transField
+}
+
 func GetTopKTrans(name string, args []string, alias string, e *CHEngine) (Statement, int, string, error) {
 	db := e.DB
 	table := e.Table
@@ -230,6 +270,11 @@ func GetTopKTrans(name string, args []string, alias string, e *CHEngine) (Statem
 	var metricStruct *metrics.Metrics
 	for i, field := range fields {
 		field = strings.Trim(field, "`")
+		isEnum := false
+		if strings.HasPrefix(field, "enum(") && strings.HasSuffix(field, ")") && len(field) > 6 {
+			field = field[5 : len(field)-1]
+			isEnum = true
+		}
 		metricStruct, ok = metrics.GetAggMetrics(field, e.DB, e.Table, e.ORGID, e.NativeField)
 		if !ok || metricStruct.Type == metrics.METRICS_TYPE_ARRAY {
 			return nil, 0, "", nil
@@ -240,41 +285,14 @@ func GetTopKTrans(name string, args []string, alias string, e *CHEngine) (Statem
 		condition := metricStruct.Condition
 
 		// enum tag
-		tagEnum := strings.TrimSuffix(field, "_0")
-		tagEnum = strings.TrimSuffix(tagEnum, "_1")
-		tagDes, getTagOK := tag.GetTag(field, db, table, "enum")
-		enumTable := table
-		if slices.Contains([]string{chCommon.DB_NAME_DEEPFLOW_ADMIN, chCommon.DB_NAME_DEEPFLOW_TENANT, chCommon.DB_NAME_PROMETHEUS, chCommon.DB_NAME_EXT_METRICS}, db) {
-			enumTable = chCommon.DB_TABLE_MAP[db][0]
-		}
-		tagDescription, tagOK := tag.TAG_DESCRIPTIONS[tag.TagDescriptionKey{
-			DB: db, Table: enumTable, TagName: field,
-		}]
-		if getTagOK {
-			nameColumn := ""
-			if e.Language != "" {
-				nameColumn = "name_" + e.Language
-			} else {
-				cfgLang := ""
-				if config.Cfg.Language == "en" {
-					cfgLang = "en"
-				} else {
-					cfgLang = "zh"
-				}
-				nameColumn = "name_" + cfgLang
-			}
-			if tagOK {
-				enumFileName := tagDescription.EnumFile
-				dbFields[i] = fmt.Sprintf(tagDes.TagTranslator, nameColumn, enumFileName)
-			} else {
-				dbFields[i] = fmt.Sprintf(tagDes.TagTranslator, nameColumn, tagEnum)
-			}
+		if isEnum {
+			dbFields[i] = processEnumField(field, db, table, e)
 		}
 
-		if condition == "" && metricStruct.TagType != "int" {
+		if condition == "" && metricStruct.TagType != "int" && metricStruct.TagType != "int_enum" {
 			if metricStruct.TagType == "string" || metricStruct.TagType == "ip" {
 				condition = dbFields[i] + " != ''"
-			} else if metricStruct.TagType == "int" || metricStruct.TagType == "id" {
+			} else if metricStruct.TagType == "id" {
 				condition = dbFields[i] + " != 0"
 			} else if metricStruct.TagType == "resource" && strings.Contains(metricStruct.DisplayName, "_id") {
 				if strings.Contains(metricStruct.DisplayName, "epc") {
@@ -578,7 +596,9 @@ func (f *AggFunction) FormatInnerTag(m *view.Model) (innerAlias string) {
 			},
 			DivType: view.FUNCTION_DIV_TYPE_0DIVIDER_AS_NULL,
 		}
-
+		if f.Metrics.Type == metrics.METRICS_TYPE_PERCENTAGE {
+			divFunction.IsLeast = true
+		}
 		// 1 - sum(x)/sum(y)
 		if strings.Trim(f.Args[0], "`") == chCommon.SUCCESS_RATIO_METRICS_NAME {
 			divFunction.Nest = true
@@ -687,6 +707,17 @@ func (f *AggFunction) Trans(m *view.Model) view.Node {
 			// Percentage type weighted average
 			if f.Name == view.FUNCTION_AVG {
 				outFunc = view.GetFunc(view.FUNCTION_DELAY_AVG)
+				outFunc.SetIsLeast(true)
+			} else {
+				dbField := f.Metrics.DBField
+				if strings.Contains(dbField, "/") {
+					if strings.HasPrefix(dbField, "1 - ") {
+						dbFieldNoPrefix := strings.TrimPrefix(dbField, "1 - ")
+						f.Metrics.DBField = "1 - " + fmt.Sprintf("least(%s, 1)", dbFieldNoPrefix)
+					} else {
+						f.Metrics.DBField = fmt.Sprintf("least(%s, 1)", dbField)
+					}
+				}
 			}
 			outFunc.SetMath("*100")
 		}

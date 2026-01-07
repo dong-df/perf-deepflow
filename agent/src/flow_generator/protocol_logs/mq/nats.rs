@@ -35,11 +35,13 @@ use crate::{
                 ExtendedInfo, KeyVal, L7ProtocolSendLog, L7Request, L7Response, TraceInfo,
             },
             set_captured_byte, swap_if, value_is_default, AppProtoHead, L7ResponseStatus,
-            LogMessageType, PrioFields, BASE_FIELD_PRIORITY,
+            PrioFields, BASE_FIELD_PRIORITY,
         },
     },
     plugin::wasm::{wasm_plugin::NatsMessage as WasmNatsMessage, WasmData},
 };
+
+use public::l7_protocol::LogMessageType;
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct Info {
@@ -202,6 +204,8 @@ pub struct NatsInfo {
     is_tls: bool,
     #[serde(skip)]
     is_async: bool,
+    #[serde(skip)]
+    is_reversed: bool,
 
     rtt: u64,
 
@@ -740,6 +744,9 @@ impl From<NatsInfo> for L7ProtocolSendLog {
         if info.is_async {
             flags = flags | ApplicationFlags::ASYNC;
         }
+        if info.is_reversed {
+            flags = flags | ApplicationFlags::REVERSED;
+        }
         let name = info.get_name();
         let subject = info
             .get_subject()
@@ -819,6 +826,9 @@ impl L7ProtocolInfoInterface for NatsInfo {
             if rsp.is_on_blacklist {
                 req.is_on_blacklist = rsp.is_on_blacklist;
             }
+            if rsp.is_reversed {
+                req.is_reversed = rsp.is_reversed;
+            }
         }
         Ok(())
     }
@@ -837,6 +847,10 @@ impl L7ProtocolInfoInterface for NatsInfo {
 
     fn is_on_blacklist(&self) -> bool {
         self.is_on_blacklist
+    }
+
+    fn is_reversed(&self) -> bool {
+        self.is_reversed
     }
 }
 
@@ -891,20 +905,27 @@ impl NatsLog {
             if let Some(is_async) = custom.is_async {
                 info.is_async = is_async;
             }
+            if let Some(is_reversed) = custom.is_reversed {
+                info.is_reversed = is_reversed;
+            }
         }
     }
 }
 
 impl L7ProtocolParserInterface for NatsLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         if !param.ebpf_type.is_raw_protocol() {
-            return false;
+            return None;
         }
         if param.l4_protocol != IpProtocol::TCP {
-            return false;
+            return None;
         }
 
-        NatsInfo::try_parse(payload, param.parse_config).is_some()
+        if NatsInfo::try_parse(payload, param.parse_config).is_some() {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
@@ -940,7 +961,9 @@ impl L7ProtocolParserInterface for NatsLog {
                 }
                 if let Some(perf_stats) = self.perf_stats.as_mut() {
                     if info.msg_type == LogMessageType::Response {
-                        if let Some(endpoint) = info.load_endpoint_from_cache(param) {
+                        if let Some(endpoint) =
+                            info.load_endpoint_from_cache(param, info.is_reversed)
+                        {
                             info.endpoint = Some(endpoint.to_string());
                         }
                     }
@@ -1050,7 +1073,7 @@ mod tests {
 
             if first_packet {
                 first_packet = false;
-                if !nats.check_payload(payload, param) {
+                if nats.check_payload(payload, param).is_none() {
                     output.push_str("not nats\n");
                     break;
                 }

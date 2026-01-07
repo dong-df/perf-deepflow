@@ -39,7 +39,7 @@ deepflow-agent uses cgroups to limit CPU usage.
 
 **Tags**:
 
-`hot_update`
+<mark>agent_restart</mark>
 
 **FQCN**:
 
@@ -64,6 +64,11 @@ global:
 **Description**:
 
 deepflow-agent uses cgroups to limit memory usage.
+
+Note:
+- Memory of the dedicated deepflow-agent is not limited
+- Memory limits for container deepflow-agent are enforced by container
+- Memory limits for container deepflow-agent in the same cluster need to be consistent
 
 ### Maximum Log Backhaul Rate {#global.limits.max_log_backhaul_rate}
 
@@ -905,6 +910,9 @@ global:
 
 Whether to synchronize the clock to the deepflow-server, this behavior
 will not change the time of the deepflow-agent running environment.
+
+Notice: Before enabling NTP, the controller needs to first start the NTP service. The agent will
+only continue to work after the time synchronization is complete.
 
 ### Maximum Drift {#global.ntp.max_drift}
 
@@ -1901,6 +1909,27 @@ inputs:
     - enabled_features:
       - ebpf.profile.on_cpu
       - proc.gprocess_info
+      match_regex: \b(?:lua|luajit)(\S)*( +-\S+)* +(\S*/)*([^ /]+)
+      match_type: cmdline_with_args
+      only_in_container: false
+      rewrite_name: $5
+    - enabled_features:
+      - ebpf.profile.on_cpu
+      - proc.gprocess_info
+      match_regex: \bphp(\d+)?(-fpm|-cli|-cgi)?( +-\S+)* +(\S*/)*([^ /]+\.php)
+      match_type: cmdline_with_args
+      only_in_container: false
+      rewrite_name: $5
+    - enabled_features:
+      - ebpf.profile.on_cpu
+      - proc.gprocess_info
+      match_regex: \b(node|nodejs)( +--\S+)* +(\S*/)*([^ /]+\.js)
+      match_type: cmdline_with_args
+      only_in_container: false
+      rewrite_name: $4
+    - enabled_features:
+      - ebpf.profile.on_cpu
+      - proc.gprocess_info
       match_regex: ^deepflow-
       only_in_container: false
     - enabled_features:
@@ -2059,6 +2088,8 @@ inputs:
 | java | |
 | golang | |
 | python | |
+| lua | |
+| php | |
 | nodejs | |
 | dotnet | |
 
@@ -4511,6 +4542,38 @@ inputs:
 
 Only collect IO events with delay exceeding this threshold.
 
+##### Virtual File Collection Enabled {#inputs.ebpf.file.io_event.enable_virtual_file_collect}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.file.io_event.enable_virtual_file_collect`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    file:
+      io_event:
+        enable_virtual_file_collect: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+When set to true, the agent will collect file I/O events generated on
+virtual file systems (such as /proc, /sys, /run, and other kernel
+pseudo file systems).
+When set to false, the agent will not collect file I/O events from
+virtual file systems.
+
 ### Profile {#inputs.ebpf.profile}
 
 #### Unwinding {#inputs.ebpf.profile.unwinding}
@@ -5102,6 +5165,98 @@ it also increases the CPU usage of the agent. Tests have shown that compressing 
 function call stack of the deepflow-agent can reduce bandwidth consumption by `x` times, but
 it will result in an additional `y%` CPU usage for the agent.
 
+#### Language-specific Profiling {#inputs.ebpf.profile.languages}
+
+Control which interpreter languages to profile. Disabling unused languages can save ~5-6 MB memory per language.
+Total memory: ~17-20 MB (all enabled), ~6.1 MB (Python only), ~5.2 MB (PHP only), ~6.4 MB (Node.js only).
+
+##### Python profiling disabled {#inputs.ebpf.profile.languages.python_disabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.languages.python_disabled`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      languages:
+        python_disabled: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Disable Python interpreter profiling. When disabled, Python process stack traces will not be collected,
+saving approximately 6.1 MB of kernel memory (python_tstate_addr_map, python_unwind_info_map, python_offsets_map).
+
+##### PHP profiling disabled {#inputs.ebpf.profile.languages.php_disabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.languages.php_disabled`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      languages:
+        php_disabled: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Disable PHP interpreter profiling. When disabled, PHP process stack traces will not be collected,
+saving approximately 5.2 MB of kernel memory (php_unwind_info_map, php_offsets_map).
+
+##### Node.js profiling disabled {#inputs.ebpf.profile.languages.nodejs_disabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.languages.nodejs_disabled`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      languages:
+        nodejs_disabled: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Disable Node.js (V8) interpreter profiling. When disabled, Node.js process stack traces will not be collected,
+saving approximately 6.4 MB of kernel memory (v8_unwind_info_map).
+
 ### Tunning {#inputs.ebpf.tunning}
 
 #### Collector Queue Size {#inputs.ebpf.tunning.collector_queue_size}
@@ -5201,6 +5356,7 @@ The number of page occupied by the shared memory of the kernel. The
 value is `2^n (5 <= n <= 13)`. Used for perf data transfer. If the
 value is between `2^n` and `2^(n+1)`, it will be automatically adjusted
 by the ebpf configurator to the minimum value `2^n`.
+The page size is 4 KB.
 
 #### Kernel Ring Size {#inputs.ebpf.tunning.kernel_ring_size}
 
@@ -6463,7 +6619,10 @@ transforms:
     - host_metrics
     source: |
       .tags.instance = "${K8S_NODE_IP_FOR_DEEPFLOW}"
-      .tags.host = "${K8S_NODE_NAME_FOR_DEEPFLOW}"
+      host_name, _ = get_env_var("K8S_NODE_NAME_FOR_DEEPFLOW")
+      if !is_empty(host_name) {
+        .tags.host = host_name
+      }
       metrics_map = {
         "boot_time": "boot_time_seconds",
         "memory_active_bytes": "memory_Active_bytes",
@@ -6547,7 +6706,7 @@ transforms:
     type: filter
     inputs:
     - cadvisor_metrics
-    condition: "!match(string!(.name), r'container_cpu_(cfs_throttled_seconds_total|load_average_10s|system_seconds_total|user_seconds_total)|container_fs_(io_current|io_time_seconds_total|io_time_weighted_seconds_total|reads_merged_total|sector_reads_total|sector_writes_total|writes_merged_total)|container_memory_(mapped_file|swap)|container_(file_descriptors|tasks_state|threads_max)|container_spec.*')"
+    condition: "!match(string!(.name), r'container_cpu_(cfs_throttled_seconds_total|load_average_10s|system_seconds_total|user_seconds_total)|container_fs_(io_current|io_time_seconds_total|io_time_weighted_seconds_total|reads_merged_total|sector_reads_total|sector_writes_total|writes_merged_total)|container_memory_(mapped_file|swap)|container_(file_descriptors|tasks_state|threads_max)')"
   kubelet_relabel_filter:
     type: filter
     inputs:
@@ -7294,6 +7453,100 @@ deepflow-agent will mark the application protocol for each
 <vpc, ip, protocol, port> tuple. In order to avoid misidentification caused by IP
 changes, the validity period after successfully identifying the protocol will be
 limited to this value.
+
+#### Inference whitelist {#processors.request_log.application_protocol_inference.inference_whitelist}
+
+**Tags**:
+
+`hot_update`
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.inference_whitelist`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      inference_whitelist:
+      - port_list:
+        - 15001
+        - 15006
+        process_name: envoy
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | dict |
+
+**Description**:
+
+Application protocol port whitelist, currently only supports eBPF traffic. When eBPF data is on the whitelist,
+the application table is no longer used to query the application protocol. The corresponding application protocol
+is obtained by polling all currently supported protocols. Having too much data on the whitelist greatly reduces the
+processing performance of eBPF data.
+
+Configuration Key:
+- process_name: Process name, regular expressions are not supported
+- port_list: Port Whitelist
+
+##### Process name {#processors.request_log.application_protocol_inference.inference_whitelist.process_name}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.inference_whitelist.process_name`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      inference_whitelist:
+      - process_name: ''
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**Description**:
+
+Process name
+
+##### Port list {#processors.request_log.application_protocol_inference.inference_whitelist.port_list}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.inference_whitelist.port_list`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      inference_whitelist:
+      - port_list: []
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+
+**Description**:
+
+Port list
 
 #### Enabled Protocols {#processors.request_log.application_protocol_inference.enabled_protocols}
 
@@ -8747,7 +9000,7 @@ Field name.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 <mark>ee_feature</mark>
 
 **FQCN**:
@@ -8769,40 +9022,239 @@ processors:
 
 **Description**:
 
-Custom field extraction policies, used to extract custom fields from L7 protocols
+Custom field extraction policy, used to extract possible custom fields from L7 protocols via simple rules.
+When both plugin extraction and custom extraction policies match, the priority is as follows:
+1. Plugin extraction
+2. Custom field policies extraction
+3. Agent default extraction
 Example:
 ```yaml
-- policy_name: "my_policy" # name of current policy
-  protocol_name: HTTP # protocol name, if protocol is Grpc, please set it to HTTP2, optional values: HTTP/HTTP2/Dubbo/SofaRPC/Custom/...
-  custom_protocol_name: "my_protocol"  # when protocol_name is Custom are effected, and there must be a `processors.request_log.application_protocol_inference.custom_protocols` configuration with the same name, otherwise it cannot be parsed
-  port_list: 1-65535
+- policy_name: "my_policy" # Policy name
+  protocol_name: HTTP # Protocol name. If you want to parse Grpc, configure as HTTP2. Possible values: HTTP/HTTP2/Dubbo/SofaRPC/Custom/...
+  custom_protocol_name: "my_protocol"  # Effective only when protocol_name is Custom. Note: At this time, there must be a `processors.request_log.application_protocol_inference.custom_protocols` config, and the custom protocol name must match exactly, otherwise parsing will not work.
+  filters:
+    traffic_direction: both # Search in request, response, or both. Default is both.
+    port_list: 1-65535 # Can be used to filter by port.
+    feature_string: "" # For pre-matching Payload extraction, does not apply to header_field type.
+  # Whether to save the original payload.
+  # Note: This configuration is only effective when the "filters" are met.
+  raw:
+    save_request:
+      enabled: false
+      output:
+        attribute_name: request
+    save_response:
+      enabled: false
+      output:
+        attribute_name: response
   fields:
-  - field_name: "my_field"
-    field_match_type: "string"  # optional values: "string"
-    field_match_ignore_case: "false" # wheather ignore case when match field, default: false
-    field_match_keyword: "abc"  # can be filled with additional characters to improve accuracy, for example `"\"abc\": \""`
-
-    subfield_match_keyword: "y" # in some cases, we need to extract a subfield, for example, in the HTTP Cookie field, we only need to extract part of it, such as extracting the value corresponding to y from `abc: x=1,y=2,z=3` (the value is `x=1,y=2,z=3`)
-    separator_between_subfield_kv_pair: "," # default: empty
-    separator_between_subfield_key_and_value: "=" # default: empty
-
-    field_type: "http_url_field" # field type of extraction, optional values: http_url_field/header_field/payload_json_value/payload_xml_value/payload_hessian2_value, default value: header_field
-    traffic_direction: request # could be limited to search only in request (or only in response), optional values: request/response/both, default value: both
-    check_value_charset: false # used for checking whether the extracted result is legal
-    value_primary_charset: ["digits", "alphabets", "chinese"] # used for checking the character set of the extracted result, optional values: digits/alphabets/chinese
-    value_special_charset: ".-_" # used for checking the character set of the extracted result
-    attribute_name: "xyz" # this field will appear in the calling log's attribute.xyz, default value is empty, if empty, this field will not be added to attribute
-    rewrite_native_tag: version # rewrite can fill in one of the following fields to overwrite the corresponding field value: version/request_type/request_domain/request_resource/request_id/endpoint/response_code/response_exception/response_result/trace_id/span_id/x_request_id/http_proxy_client
-    rewrite_response_status: # rewrite response_status field, when response_code is in success_values array, response_status will be set to success, otherwise set to server_error
-      success_values: []
-    metric_name: "xyz"  # this field will appear in the calling log's metrics.xyz, default value is empty
-```
-notice: the different values of field_type will affect the extraction method of the field, as follows:
-- `http_url_field`: extract field from HTTP URL parameters at the end of the URL, such as `?key=value&key2=value2`
-- `header_field`: extract field from the Header part of HTTP/Dubbo/SofaRPC/... protocols, such as HTTP Header like `key: value`
-- `payload_json_value`: extract field from Json Payload, such as `"key": 1`, or `"key": "value"`, or `"key": None`, etc.
-- `payload_xml_value`: extract field from XML Payload, such as `<key attr="xxx">value</key>`
-- `payload_hessian2_value`: extract field from Payload encoded with Hessian2
+  - name: "my_field" # Configured field
+    # Field extraction type, possible values and meanings:
+    # - `http_url_field`: Extract field from HTTP URL parameters at the end of the URL, e.g. `?key=value&key2=value2`
+    # - `header_field`: Extract field from protocol header section (HTTP/Dubbo/SofaRPC/...); for HTTP, e.g. `key: value`
+    # - `payload_json_value`: Extract field from JSON payload, e.g. `"key": 1`, `"key": "value"`, `"key": None`, etc.
+    # - `payload_xml_value`: Extract field from XML payload, e.g. `<key attr="xxx">value</key>`
+    # - `payload_hessian2_value`: Extract field from payload using Hessian2 encoding.
+    # - `sql_insertion_column`: Extract column from SQL insert statement, e.g. `INSERT INTO table (column1, column2) VALUES (value1, value2)`. Currently only MySQL is supported and only the first column's value can be extracted.
+    type: "http_url_field"
+    # Matching rule
+    match:
+      # Match type, possible values: "string" and "path"
+      # When set to "string":
+      # - For http_url_field and header_field, matches key; for sql_insertion_column, matches SQL insert column name.
+      # - For payload_json_value and payload_xml_value, matches JSON or XML content and takes the first matched element as the result.
+      # "path" type applies only to parse_json_value and parse_xml_value, supports extraction using hierarchical syntax like "aaa.bbb.ccc" for JSON and XML content.
+      type: "string"
+      keyword: "abc"
+      # Ignore case. Default: false. Only valid when `type` is "string".
+      ignore_case: false
+      # Apply field rule to all leaf nodes. Default: false.
+      # Only effective for parse_json_value and parse_xml_value types.
+      # When set to true:
+      # - Apply keyword matching to all leaf nodes in JSON or XML content.
+      # - Only attribute_name in output is valid, serving as the prefix of the output result. The output name uses attribute_name as prefix and the leaf node's path as suffix, separated by ".".
+      # - This field cannot be used in compound_fields.
+      all_leaves: false
+    # Post-processing. Note that settings are executed in order.
+    # Configuration format:
+    # - type: post_processing_type
+    #   settings:
+    #   - key: setting_key
+    #     value: setting_value
+    # Supported types for 'type' are:
+    # - remap
+    # - obfuscate
+    # - url_decode
+    # - base64_decode
+    # - parse_json_value
+    # - parse_xml_value
+    # - parse_key_value
+    # See below for details and configuration of each type
+    post:
+    # remap is used to map the extraction result to another value
+    # Supported settings:
+    # - dictionary_name: Name of the dictionary
+    - type: remap
+      settings:
+      - key: dictionary_name
+        value: dict_1
+    # obfuscate is used for masking/desensitizing extracted results
+    # Supported settings:
+    # - mask: The character used for masking, default is *, supports only ascii characters
+    # - preset: Use a prebuilt masking method, valid values are:
+    #   - id-card-name: Chinese ID card name masking (show only the first character of the name)
+    #   - id-card-number: Chinese ID card number masking (show only first 6 and last 4 digits)
+    #   - phone-number: Phone number masking (hide at least 4 characters in the middle)
+    # - range: Indicates which characters (by index) to mask with *, e.g. retain only the first and last character
+    - type: obfuscate
+      settings:
+      - key: mask
+        value: *
+      - key: preset
+        value: id-card-name
+      - key: range
+        value: "1, -1" # Mask from the second to the last character, keeping only the first character
+      - key: range # Multiple 'range' settings represent multiple masked ranges
+        value: "6, -5" # Mask from the 7th to the 5th from last character
+    # url_decode is used to decode the extracted result using URL-decoding
+    - type: url_decode
+    # base64_decode is used to decode the extracted result using Base64, output must be valid UTF-8
+    - type: base64_decode
+    # parse_json_value is used to further parse the extracted result as JSON
+    # Supported settings:
+    # - keyword: Key word to match
+    # - type: Value type, options are string/path
+    # - ignore_case: Whether to ignore case, default false
+    # - skip: Skip the first N matches, use from this index
+    - type: parse_json_value
+      settings:
+      - key: keyword
+        value: xyz
+      - key: type
+        value: string
+      - key: ignore_case
+        value: false
+      - key: skip
+        value: 0
+    # parse_xml_value is used to further parse the extracted result as XML
+    # Supported settings:
+    # - keyword: Key word to match
+    # - type: Value type, options are string/path
+    # - ignore_case: Whether to ignore case, default false
+    # - skip: Skip the first N matches, use from this index
+    - type: parse_xml_value
+      # This configuration is the same as fields->match, but in key/value form.
+      # Also, skip is supported to indicate which matching result to take.
+      settings:
+      - key: keyword
+        value: xyz
+      - key: type
+        value: string
+      - key: ignore_case
+        value: false
+      - key: skip
+        value: 0
+    # parse_key_value parses the result as key-value pairs
+    # Supported settings:
+    # - key_value_pair_separator: Separator between key-value pairs, default ","
+    # - key_value_separator: Separator between key and value, default "="
+    # - keyword: Key word to match
+    # - ignore_case: Whether to ignore case, default false
+    - type: parse_key_value
+      settings:
+      - key: key_value_pair_separator
+        value: ","
+      - key: key_value_separator
+        value: "="
+      - key: keyword
+        value: xyz
+      - key: ignore_case
+        value: true
+    # Validate if the post-processed result is legal
+    verify:
+      check_charset: false # Can be used to check if extraction result is valid
+      primary_charset: ["digits", "alphabets", "hanzi"] # Charsets used to check extraction result; optional values: digits/alphabets/hanzi
+      special_characters: ".-_" # Additional special characters allowed in result charset
+    output:
+      attribute_name: "xyz" # This field will appear in calling log as attribute.xyz. Default is empty; if empty, this field will not be added to the attribute.
+      metric_name: "xyz" # This field will appear in calling log as metrics.xyz. Default is empty.
+      rewrite_native_tag:
+        # Fill one of the following fields to overwrite the corresponding value
+        # Note: This requires support in the corresponding protocol, otherwise the configuration will not take effect
+        # When overwriting response_code, the original non-empty value will be saved into the attribute as `sys_response_code`
+        # - version
+        # - request_type
+        # - request_domain
+        # - request_resource
+        # - request_id
+        # - endpoint
+        # - response_code
+        # - response_exception
+        # - response_result
+        # - trace_id
+        # - span_id
+        # - x_request_id
+        # - x_request_id_0
+        # - x_request_id_1
+        # - http_proxy_client
+        # - biz_type
+        # - biz_code
+        # - biz_scenario
+        name: version
+        # When remapping, the input will be mapped using the configured dictionary. If empty, it will not take effect
+        # Note: The whitelist/blacklist in condition match the remapped result
+        remap: dict_1
+        condition:
+          enum_whitelist: [] # Whitelist: when the extraction result is in the list, overwrite. If empty, does not take effect.
+          enum_blacklist: [] # Blacklist: when result matches any in the list, do not update.
+      # Match to these arrays by extraction value. If matched, rewrite response_status to the corresponding value.
+      rewrite_response_status:
+        ok_values: []
+        client_error_values: []
+        server_error_values: []
+        default_status: "" # Optional: ok/client_error/server_error. If empty and no match, will NOT rewrite. Default is empty.
+      # Field output priority. Default is 0. Range 0-255. Smaller values have higher priority.
+      # For fields that keep only one value (except trace_id), only the one with the smallest priority is kept.
+      # For fields with multiple values (trace_id), output them in order from highest to lowest priority.
+      priority: 0
+  # Directly use a constant value as the field value
+  const_fields:
+  - value: "123"
+    # Output configuration, refer to the "output" section of "fields"
+    # "metric", "rewrite_response_status", and the "condition" and "remap" in "rewrite_native_tag" are not supported here
+    output:
+      attribute_name: "xyz"
+      rewrite_native_tag:
+        name: version
+      priority: 0
+  # Compound fields allow you to use configured fields or native_tags as input fields for formatted output
+  # If the corresponding field or native_tag is not resolved or is empty, the output will not be produced
+  compound_fields:
+  - format: "{field1_name}-{field2_name}" # Output format. field1_name and field2_name are the configured field names
+                                          # Native tags can also be used as an input field, but note that the configured fields take precedence.
+    output: # Configure as described in "output" section of "fields"
+      attribute_name: "xyz"
+      metric_name: "xyz"
+      rewrite_native_tag:
+        name: version
+        remap: dict_1
+        condition:
+          enum_whitelist: []
+          enum_blacklist: []
+      rewrite_response_status:
+        ok_values: []
+        client_error_values: []
+        server_error_values: []
+        default_status: ""
+      priority: 0
+  dictionaries:
+  - name: dict_1
+    entries:
+    - key: key1
+      value: value1
+    - key: key2
+      value: value2
+    default: value3
 
 #### Obfuscate Protocols {#processors.request_log.tag_extraction.obfuscate_protocols}
 
@@ -9548,10 +10000,37 @@ processors:
 
 **Description**:
 
-Maximum number of flows that can be stored in FlowMap, It will also affect the capacity of
-the RRT cache, Example: `rrt-cache-capacity` = `flow-count-limit`. When `rrt-cache-capacity`
-is not enough, it will be unable to calculate the rrt of l7. When `inputs.cbpf.common.capture_mode`
-is `Physical Mirror` and concurrent_flow_limit is less than or equal to 65535, it will be forced to u32::MAX.
+Maximum number of flows that can be stored in FlowMap. When `inputs.cbpf.common.capture_mode` is `Physical Mirror`
+and concurrent_flow_limit is less than or equal to 65535, it will be forced to u32::MAX.
+
+#### RRT Cache Capacity {#processors.flow_log.tunning.rrt_cache_capacity}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.flow_log.tunning.rrt_cache_capacity`
+
+**Default value**:
+```yaml
+processors:
+  flow_log:
+    tunning:
+      rrt_cache_capacity: 16000
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [1024, 64000000] |
+
+**Description**:
+
+The capacity of the RRT Cache table in FlowMap. This table is used to calculate RRT latency metrics. If it is too large,
+it will cause high memory usage in the agent; if it is too small, RRT metrics may be missing.
 
 #### Memory Pool Size {#processors.flow_log.tunning.memory_pool_size}
 
@@ -10787,6 +11266,12 @@ outputs:
 Whether to compress the l4 flow log.
 
 # Plugins {#plugins}
+
+Plugin support
+When both plugins and custom extraction policies match, the priority is:
+1. Plugin extraction
+2. Custom field policies extraction
+3. Agent default extraction
 
 ## Wasm Plugins {#plugins.wasm_plugins}
 

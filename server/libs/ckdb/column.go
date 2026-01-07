@@ -58,6 +58,8 @@ const (
 	COLUMN_AZ_ID_0                    = "az_id_0"
 	COLUMN_AZ_ID_1                    = "az_id_1"
 	COLUMN_BIZ_TYPE                   = "biz_type"
+	COLUMN_BIZ_CODE                   = "biz_code"
+	COLUMN_BIZ_SCENARIO               = "biz_scenario"
 	COLUMN_BODY                       = "body"
 	COLUMN_BYTE                       = "byte"
 	COLUMN_BYTES                      = "bytes"
@@ -104,6 +106,7 @@ const (
 	COLUMN_FILE_DIR                   = "file_dir"
 	COLUMN_FILE_NAME                  = "file_name"
 	COLUMN_FILE_TYPE                  = "file_type"
+	COLUMN_FIN_COUNT                  = "fin_count"
 	COLUMN_FLOW_ID                    = "flow_id"
 	COLUMN_AGGREGATED_FLOW_IDS        = "aggregated_flow_ids"
 	COLUMN_FLOW_LOAD                  = "flow_load"
@@ -115,6 +118,7 @@ const (
 	COLUMN_HOST_ID_1                  = "host_id_1"
 	COLUMN_HTTP_PROXY_CLIENT          = "http_proxy_client"
 	COLUMN_ID                         = "id"
+	COLUMN_INIT_IPID                  = "init_ipid"
 	COLUMN_IP4                        = "ip4"
 	COLUMN_IP4_0                      = "ip4_0"
 	COLUMN_IP4_1                      = "ip4_1"
@@ -126,6 +130,7 @@ const (
 	COLUMN_IS_NEW_FLOW                = "is_new_flow"
 	COLUMN_IS_TLS                     = "is_tls"
 	COLUMN_IS_ASYNC                   = "is_async"
+	COLUMN_IS_REVERSED                = "is_reversed"
 	COLUMN_L2_END_0                   = "l2_end_0"
 	COLUMN_L2_END_1                   = "l2_end_1"
 	COLUMN_L3_BYTE_RX                 = "l3_byte_rx"
@@ -162,7 +167,9 @@ const (
 	COLUMN_METRICS_NAMES              = "metrics_names"
 	COLUMN_METRICS_VALUES             = "metrics_values"
 	COLUMN_METRIC_ID                  = "metric_id"
+	COLUMN_METRIC_UNIT                = "metric_unit"
 	COLUMN_METRIC_VALUE               = "metric_value"
+	COLUMN_METRIC_VALUE_STR           = "metric_value_str"
 	COLUMN_MOUNT_SOURCE               = "mount_source"
 	COLUMN_MOUNT_POINT                = "mount_point"
 	COLUMN_NAT_REAL_IP4_0             = "nat_real_ip4_0"
@@ -173,6 +180,8 @@ const (
 	COLUMN_NEW_FLOW                   = "new_flow"
 	COLUMN_OBSERVATION_POINT          = "observation_point"
 	COLUMN_OFFSET                     = "offset"
+	COLUMN_OOO_TX                     = "ooo_tx"
+	COLUMN_OOO_RX                     = "ooo_rx"
 	COLUMN_PACKET                     = "packet"
 	COLUMN_PACKET_BATCH               = "packet_batch"
 	COLUMN_PACKET_COUNT               = "packet_count"
@@ -326,6 +335,7 @@ const (
 	COLUMN_TRACE_ID                   = "trace_id"
 	COLUMN_TRACE_ID_2                 = "_trace_id_2"
 	COLUMN_TRACE_ID_INDEX             = "trace_id_index"
+	COLUMN_TRIGGER_THRESHOLD          = "trigger_threshold"
 	COLUMN_TUNNEL_IP_ID               = "tunnel_ip_id"
 	COLUMN_TUNNEL_IS_IPV4             = "tunnel_is_ipv4"
 	COLUMN_TUNNEL_RX_ID               = "tunnel_rx_id"
@@ -393,6 +403,8 @@ var ColumnNames = []string{
 	COLUMN_AZ_ID_0,
 	COLUMN_AZ_ID_1,
 	COLUMN_BIZ_TYPE,
+	COLUMN_BIZ_CODE,
+	COLUMN_BIZ_SCENARIO,
 	COLUMN_BODY,
 	COLUMN_BYTE,
 	COLUMN_BYTES,
@@ -439,6 +451,7 @@ var ColumnNames = []string{
 	COLUMN_FILE_DIR,
 	COLUMN_FILE_NAME,
 	COLUMN_FILE_TYPE,
+	COLUMN_FIN_COUNT,
 	COLUMN_FLOW_ID,
 	COLUMN_AGGREGATED_FLOW_IDS,
 	COLUMN_FLOW_LOAD,
@@ -450,6 +463,7 @@ var ColumnNames = []string{
 	COLUMN_HOST_ID_1,
 	COLUMN_HTTP_PROXY_CLIENT,
 	COLUMN_ID,
+	COLUMN_INIT_IPID,
 	COLUMN_IP4,
 	COLUMN_IP4_0,
 	COLUMN_IP4_1,
@@ -461,6 +475,7 @@ var ColumnNames = []string{
 	COLUMN_IS_NEW_FLOW,
 	COLUMN_IS_TLS,
 	COLUMN_IS_ASYNC,
+	COLUMN_IS_REVERSED,
 	COLUMN_L2_END_0,
 	COLUMN_L2_END_1,
 	COLUMN_L3_BYTE_RX,
@@ -497,7 +512,9 @@ var ColumnNames = []string{
 	COLUMN_METRICS_NAMES,
 	COLUMN_METRICS_VALUES,
 	COLUMN_METRIC_ID,
+	COLUMN_METRIC_UNIT,
 	COLUMN_METRIC_VALUE,
+	COLUMN_METRIC_VALUE_STR,
 	COLUMN_MOUNT_SOURCE,
 	COLUMN_MOUNT_POINT,
 	COLUMN_NAT_REAL_IP4_0,
@@ -508,6 +525,8 @@ var ColumnNames = []string{
 	COLUMN_NEW_FLOW,
 	COLUMN_OBSERVATION_POINT,
 	COLUMN_OFFSET,
+	COLUMN_OOO_TX,
+	COLUMN_OOO_RX,
 	COLUMN_PACKET,
 	COLUMN_PACKET_BATCH,
 	COLUMN_PACKET_COUNT,
@@ -660,6 +679,7 @@ var ColumnNames = []string{
 	COLUMN_TRACE_FLAGS,
 	COLUMN_TRACE_ID,
 	COLUMN_TRACE_ID_INDEX,
+	COLUMN_TRIGGER_THRESHOLD,
 	COLUMN_TUNNEL_IP_ID,
 	COLUMN_TUNNEL_IS_IPV4,
 	COLUMN_TUNNEL_RX_ID,

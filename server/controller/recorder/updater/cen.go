@@ -74,11 +74,6 @@ func NewCEN(wholeCache *cache.Cache, cloudData []cloudmodel.CEN) *CEN {
 	return updater
 }
 
-func (c *CEN) getDiffBaseByCloudItem(cloudItem *cloudmodel.CEN) (diffBase *diffbase.CEN, exists bool) {
-	diffBase, exists = c.diffBaseData[cloudItem.Lcuuid]
-	return
-}
-
 func (c *CEN) generateDBItemToAdd(cloudItem *cloudmodel.CEN) (*metadbmodel.CEN, bool) {
 	vpcIDs := []int{}
 	for _, vpcLcuuid := range cloudItem.VPCLcuuids {
@@ -96,7 +91,7 @@ func (c *CEN) generateDBItemToAdd(cloudItem *cloudmodel.CEN) (*metadbmodel.CEN, 
 		Name:   cloudItem.Name,
 		Label:  cloudItem.Label,
 		Domain: c.metadata.GetDomainLcuuid(),
-		VPCIDs: rcommon.IntSliceToString(vpcIDs),
+		VPCIDs: vpcIDs,
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true

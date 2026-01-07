@@ -19,7 +19,7 @@ package tagrecorder
 const (
 	SQL_CREATE_DICT               = "CREATE DICTIONARY %s.%s\n"
 	SQL_SOURCE_MYSQL              = "SOURCE(%s(%sPORT %d USER '%s' PASSWORD '%s' %sDB %s TABLE %s UPDATE_FIELD 'updated_at' INVALIDATE_QUERY 'select max(updated_at) from %s'))\n"
-	SQL_SOURCE_DM                 = "SOURCE(ODBC(CONNECTION_STRING 'DSN=%s' DB %s TABLE %s INVALIDATE_QUERY 'select max(updated_at) from %s'))\n"
+	SQL_SOURCE_DM                 = "SOURCE(ODBC(CONNECTION_STRING 'DSN=%s' DB %s TABLE %s INVALIDATE_QUERY 'select max(updated_at) from %s.%s'))\n"
 	SQL_LIFETIME                  = "LIFETIME(MIN 30 MAX %d)\n"
 	SQL_LAYOUT_FLAT               = "LAYOUT(FLAT())"
 	SQL_LAYOUT_COMPLEX_KEY_HASHED = "LAYOUT(COMPLEX_KEY_HASHED())"
@@ -65,6 +65,19 @@ const (
 		"    `hostname` String,\n" +
 		"    `ip` String,\n" +
 		"    `subnet_id` UInt64,\n" +
+		"    `team_id` UInt64,\n" +
+		"    `domain_id` UInt64\n" +
+		")\n" +
+		"PRIMARY KEY id\n" +
+		"%s" +
+		SQL_LIFETIME +
+		SQL_LAYOUT_FLAT
+	CREATE_BIZ_SERVICE_DICTIONARY_SQL = SQL_CREATE_DICT +
+		"(\n" +
+		"    `id` UInt64,\n" +
+		"    `name` String,\n" +
+		"    `service_group_name` String,\n" +
+		"    `icon_id` Int64,\n" +
 		"    `team_id` UInt64,\n" +
 		"    `domain_id` UInt64\n" +
 		")\n" +
